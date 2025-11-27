@@ -32,33 +32,35 @@ BATCH_SIZES = [1]
 INPUT_LENS = (4096,)
 OUTPUT_LENS = (512,)
 
-# Models to test
+# Models to test (all using FP8 quantization)
 MODELS = {
     "deepseek-v3": {
         "path": "deepseek-ai/DeepSeek-V3",
         "is_moe": True,
-        "extra_args": ["--trust-remote-code"],
+        "extra_args": ["--trust-remote-code", "--quantization", "fp8"],
     },
     "qwen3-235b": {
-        "path": "Qwen/Qwen3-235B-A22B-Instruct-2507",
+        "path": "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8",
         "is_moe": True,
-        "extra_args": ["--trust-remote-code"],
+        "extra_args": ["--trust-remote-code", "--quantization", "fp8"],
     },
     "qwen3-coder-480b": {
-        "path": "Qwen/Qwen3-Coder-480B-A35B-Instruct",
+        "path": "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8",
         "is_moe": True,
-        "extra_args": ["--trust-remote-code"],
+        "extra_args": ["--trust-remote-code", "--quantization", "fp8"],
     },
     "minimax-m2": {
         "path": "MiniMaxAI/Minimax-M2",
         "is_moe": True,
-        "extra_args": ["--trust-remote-code"],
+        "extra_args": ["--trust-remote-code", "--quantization", "fp8"],
     },
     "kimi-k2": {
         "path": "moonshotai/Kimi-K2-Thinking",
         "is_moe": True,
         "extra_args": [
             "--trust-remote-code",
+            "--quantization",
+            "fp8",
             "--tool-call-parser",
             "kimi_k2",
             "--reasoning-parser",
@@ -68,12 +70,12 @@ MODELS = {
     "glm-4-6": {
         "path": "zai-org/GLM-4.6",
         "is_moe": False,
-        "extra_args": ["--trust-remote-code"],
+        "extra_args": ["--trust-remote-code", "--quantization", "fp8"],
     },
     "llama-32": {
         "path": "meta-llama/Llama-3.2-90B-Vision-Instruct",
         "is_moe": False,
-        "extra_args": ["--trust-remote-code"],
+        "extra_args": ["--trust-remote-code", "--quantization", "fp8"],
     },
 }
 
