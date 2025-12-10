@@ -27,6 +27,17 @@ use rand::{
 // Import the tree module
 use sgl_model_gateway::policies::tree::Tree;
 
+// Global results storage for summary
+lazy_static::lazy_static! {
+    static ref BENCHMARK_RESULTS: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
+}
+
+fn add_result(category: &str, result: String) {
+    let mut results = BENCHMARK_RESULTS.lock().unwrap();
+    let index = results.len();
+    results.insert(format!("{:03}_{}", index, category), result);
+}
+
 /// Simulated HTTP/gRPC endpoints representing worker nodes
 /// These mirror real-world deployment patterns with 10 tenants
 const ENDPOINT_TENANTS: [&str; 10] = [
@@ -42,15 +53,6 @@ const ENDPOINT_TENANTS: [&str; 10] = [
     "http://10.0.0.101:8000",
 ];
 
-/// Realistic system prompts used in LLM applications
-const SYSTEM_PROMPTS: [&str; 5] = [
-    "You are a helpful assistant that provides accurate and concise answers.",
-    "You are a coding expert. Help the user write clean, efficient code.",
-    "You are a creative writer. Generate engaging and original content.",
-    "You are a data analyst. Provide insights based on the given data.",
-    "You are a customer support agent. Be polite and helpful.",
-];
-
 /// Common conversation prefixes that create shared tree paths
 const CONVERSATION_PREFIXES: [&str; 6] = [
     "<|system|>\nYou are a helpful assistant.\n<|user|>\n",
@@ -60,17 +62,6 @@ const CONVERSATION_PREFIXES: [&str; 6] = [
     "User: ",
     "### Instruction:\n",
 ];
-
-// Global results storage for summary
-lazy_static::lazy_static! {
-    static ref BENCHMARK_RESULTS: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
-}
-
-fn add_result(category: &str, result: String) {
-    let mut results = BENCHMARK_RESULTS.lock().unwrap();
-    let index = results.len();
-    results.insert(format!("{:03}_{}", index, category), result);
-}
 
 /// Generate random ASCII strings of given length
 fn random_ascii_string(len: usize) -> String {
@@ -98,12 +89,6 @@ fn generate_realistic_requests(count: usize) -> Vec<String> {
             )
         })
         .collect()
-}
-
-/// Get a random endpoint tenant
-fn random_endpoint() -> &'static str {
-    let mut rng = thread_rng();
-    ENDPOINT_TENANTS[rng.random_range(0..ENDPOINT_TENANTS.len())]
 }
 
 /// Benchmark single-threaded insert throughput with endpoint tenants
