@@ -236,6 +236,7 @@ def ring_attn(
         query=query,
         key=key,
         value=value,
+        group=ring_pg,  # Add group parameter for compatibility
     )
 
     if use_segment_id:

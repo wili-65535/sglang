@@ -118,6 +118,7 @@ class SamplingParams:
     # Denoising parameters
     num_inference_steps: int = None
     guidance_scale: float = None
+    guidance_scale_2: float = None  # For models with dual guidance (e.g., Wan)
     guidance_rescale: float = 0.0
     boundary_ratio: float | None = None
 

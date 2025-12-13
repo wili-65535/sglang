@@ -201,12 +201,15 @@ class DenoisingStage(PipelineStage):
         )
 
         if get_world_size() > 1:
+            # Enable local caching in distributed environment
+            # Each GPU will cache its own activation shards independently
             logger.warning(
-                "cache-dit is disabled in distributed environment (world_size=%d). "
-                "Distributed support will be added in a future version.",
+                "cache-dit is running in distributed environment (world_size=%d). "
+                "Using local caching strategy: each GPU caches its own activation shards. "
+                "This may be less accurate than single-GPU caching but provides speedup.",
                 get_world_size(),
             )
-            return
+            # Don't return - allow cache-dit to proceed
         # === Parse SCM configuration from envs ===
         # SCM is shared between primary and secondary transformers
         scm_preset = envs.SGLANG_CACHE_DIT_SCM_PRESET

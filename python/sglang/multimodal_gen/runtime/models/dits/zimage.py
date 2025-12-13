@@ -6,9 +6,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.multimodal_gen.configs.models.dits.zimage import ZImageDitConfig
+from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
-from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.linear import (
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import _apply_rotary_emb
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
@@ -74,17 +80,20 @@ class TimestepEmbedder(nn.Module):
 class FeedForward(nn.Module):
     def __init__(self, dim: int, hidden_dim: int):
         super().__init__()
-        self.w1 = ReplicatedLinear(dim, hidden_dim, bias=False)
-        self.w2 = ReplicatedLinear(hidden_dim, dim, bias=False)
-        self.w3 = ReplicatedLinear(dim, hidden_dim, bias=False)
-
-    def _forward_silu_gating(self, x1, x3):
-        return F.silu(x1) * x3
+        self.hidden_dim = hidden_dim
+        # Fuse w1 and w3 into a single MergedColumnParallelLinear
+        self.w13 = MergedColumnParallelLinear(
+            dim, [hidden_dim, hidden_dim], bias=False, gather_output=False
+        )
+        self.act = SiluAndMul()
+        self.w2 = RowParallelLinear(hidden_dim, dim, bias=False)
 
     def forward(self, x):
-        x1, _ = self.w1(x)
-        x3, _ = self.w3(x)
-        out, _ = self.w2(self._forward_silu_gating(x1, x3))
+        w13_out, _ = self.w13(x)
+        # SiluAndMul expects input with shape [..., 2 * hidden_dim]
+        # and returns [..., hidden_dim] after applying silu(x1) * x3
+        x = self.act(w13_out)
+        out, _ = self.w2(x)
         return out
 
 
@@ -104,9 +113,14 @@ class ZImageAttention(nn.Module):
         self.head_dim = dim // num_heads
         self.qk_norm = qk_norm
 
-        self.to_q = ReplicatedLinear(dim, dim, bias=False)
-        self.to_k = ReplicatedLinear(dim, self.head_dim * num_kv_heads, bias=False)
-        self.to_v = ReplicatedLinear(dim, self.head_dim * num_kv_heads, bias=False)
+        # Use QKVParallelLinear to fuse q, k, v projections
+        self.qkv_proj = QKVParallelLinear(
+            hidden_size=dim,
+            head_size=self.head_dim,
+            total_num_heads=num_heads,
+            total_num_kv_heads=num_kv_heads,
+            bias=False,
+        )
 
         if self.qk_norm:
             self.norm_q = RMSNorm(self.head_dim, eps=eps)
@@ -115,7 +129,7 @@ class ZImageAttention(nn.Module):
             self.norm_q = None
             self.norm_k = None
 
-        self.to_out = nn.ModuleList([ReplicatedLinear(dim, dim, bias=False)])
+        self.to_out = nn.ModuleList([RowParallelLinear(dim, dim, bias=False)])
 
         self.attn = USPAttention(
             num_heads=num_heads,
@@ -135,13 +149,18 @@ class ZImageAttention(nn.Module):
         hidden_states: torch.Tensor,
         freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
-        q, _ = self.to_q(hidden_states)
-        k, _ = self.to_k(hidden_states)
-        v, _ = self.to_v(hidden_states)
+        # QKVParallelLinear returns fused qkv
+        qkv, _ = self.qkv_proj(hidden_states)
+        
+        # Split into q, k, v based on the output partition sizes
+        q_size = self.qkv_proj.num_heads * self.head_dim
+        kv_size = self.qkv_proj.num_kv_heads * self.head_dim
+        
+        q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
 
-        q = q.view(*q.shape[:-1], self.num_heads, self.head_dim)
-        k = k.view(*k.shape[:-1], self.num_kv_heads, self.head_dim)
-        v = v.view(*v.shape[:-1], self.num_kv_heads, self.head_dim)
+        q = q.view(*q.shape[:-1], self.qkv_proj.num_heads, self.head_dim)
+        k = k.view(*k.shape[:-1], self.qkv_proj.num_kv_heads, self.head_dim)
+        v = v.view(*v.shape[:-1], self.qkv_proj.num_kv_heads, self.head_dim)
 
         if self.norm_q is not None:
             q = self.norm_q(q)

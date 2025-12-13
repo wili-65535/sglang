@@ -31,6 +31,19 @@ class ZImageArchConfig(DiTArchConfig):
         self.out_channels = self.out_channels or self.in_channels
         self.num_channels_latents = self.in_channels
         self.hidden_size = self.dim
+        
+        # Weight mapping for fused layers
+        # Maps old weight names to new fused weight names with shard_id
+        # Format: (new_param_name, old_weight_name, shard_id)
+        self.stacked_params_mapping = [
+            # FeedForward: w1 and w3 are fused into w13
+            ("w13", "w1", 0),
+            ("w13", "w3", 1),
+            # ZImageAttention: to_q, to_k, to_v are fused into qkv_proj
+            ("qkv_proj", "to_q", "q"),
+            ("qkv_proj", "to_k", "k"),
+            ("qkv_proj", "to_v", "v"),
+        ]
 
 
 @dataclass
