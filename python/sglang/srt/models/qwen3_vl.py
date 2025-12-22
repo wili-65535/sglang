@@ -90,7 +90,8 @@ class Qwen3_VisionMLP(nn.Module):
         mlp_output, _ = self.linear_fc2(self.act(x_fc1))
         return mlp_output
 
-Qwen3VLVisionPatchEmbed_v0_v1_v2 = """
+
+deprecated_Qwen3VLVisionPatchEmbed = """
 class Qwen3VLVisionPatchEmbed(nn.Module):
     def __init__(self, config) -> None:
         super().__init__()
@@ -107,11 +108,12 @@ class Qwen3VLVisionPatchEmbed(nn.Module):
             stride=kernel_size,
             bias=True,
         )
-        self.k = self.in_channels * self.temporal_patch_size * self.patch_size * self.patch_size
         
         # wili, Conv3dToGemm
-        self.k = self.in_channels * self.temporal_patch_size * self.patch_size * self.patch_size
-        # self.ww = self.proj.weight.view(self.embed_dim, self.k).transpose(1,0)  # wili, do not use this since it will generate 2 kernels
+        self.k = self.in_channels * self.temporal_patch_size * self.patch_size ** 2
+        # wili, V1, do not use this since it will generate 2 kernels
+        # self.ww = self.proj.weight.view(self.embed_dim, self.k).transpose(1,0)
+        # wili, V2, do not use this since it is stateful and has thread-safe issue
         self.linear = nn.Linear(in_features=self.k, out_features=self.embed_dim, bias=True, dtype=self.proj.weight.dtype)
         self.is_first_call = True
 
@@ -129,7 +131,9 @@ class Qwen3VLVisionPatchEmbed(nn.Module):
                 -1, self.embed_dim
             )
         else:
-            # hidden_states = hidden_states @ self.ww + self.proj.bias  # wili
+            # wili, V1
+            # hidden_states = hidden_states @ self.ww + self.proj.bias
+            # wili, V2
             if self.is_first_call:  # wili, steal weight from Conv3d during warming up
                 with torch.no_grad():
                     self.linear.weight.copy_(self.proj.weight.view(self.embed_dim, self.k))
@@ -140,7 +144,7 @@ class Qwen3VLVisionPatchEmbed(nn.Module):
 """
 
 
-class Qwen3VLVisionPatchEmbed(nn.Module):  # wili, Qwen3VLVisionPatchEmbed v3
+class Qwen3VLVisionPatchEmbed(nn.Module):  # wili, V3
     def __init__(self, config) -> None:
         super().__init__()
         self.patch_size = config.patch_size
@@ -159,7 +163,8 @@ class Qwen3VLVisionPatchEmbed(nn.Module):  # wili, Qwen3VLVisionPatchEmbed v3
         k = self.in_channels * self.temporal_patch_size * self.patch_size ** 2
         self.linear = nn.Linear(in_features=k, out_features=self.embed_dim, bias=True, dtype=self.proj.weight.dtype)
         
-    def copy_linear_weight_from_conv3d(self):  # call this after model loading
+    def copy_linear_weight_from_conv3d(self):
+        # Call this after model loading in `sglang/srt/model_loader/loader.py: load_weights_and_postprocess()`
         print("Copy weights from Conv3d to Linear in PatchEmbed")
         with torch.no_grad():
             self.linear.weight.copy_(self.proj.weight.view(self.embed_dim, -1))
