@@ -90,7 +90,7 @@ class Qwen3_VisionMLP(nn.Module):
         mlp_output, _ = self.linear_fc2(self.act(x_fc1))
         return mlp_output
 
-
+Qwen3VLVisionPatchEmbed_v0_v1_v2 = """
 class Qwen3VLVisionPatchEmbed(nn.Module):
     def __init__(self, config) -> None:
         super().__init__()
@@ -107,7 +107,8 @@ class Qwen3VLVisionPatchEmbed(nn.Module):
             stride=kernel_size,
             bias=True,
         )
-
+        self.k = self.in_channels * self.temporal_patch_size * self.patch_size * self.patch_size
+        
         # wili, Conv3dToGemm
         self.k = self.in_channels * self.temporal_patch_size * self.patch_size * self.patch_size
         # self.ww = self.proj.weight.view(self.embed_dim, self.k).transpose(1,0)  # wili, do not use this since it will generate 2 kernels
@@ -136,6 +137,37 @@ class Qwen3VLVisionPatchEmbed(nn.Module):
                     self.is_first_call = False
             hidden_states = self.linear(hidden_states)
         return hidden_states
+"""
+
+
+class Qwen3VLVisionPatchEmbed(nn.Module):  # wili, Qwen3VLVisionPatchEmbed v3
+    def __init__(self, config) -> None:
+        super().__init__()
+        self.patch_size = config.patch_size
+        self.temporal_patch_size = config.temporal_patch_size
+        self.in_channels = config.in_channels
+        self.embed_dim = config.hidden_size
+
+        kernel_size = [self.temporal_patch_size, self.patch_size, self.patch_size]
+        self.proj = nn.Conv3d(
+            self.in_channels,
+            self.embed_dim,
+            kernel_size=kernel_size,
+            stride=kernel_size,
+            bias=True,
+        )
+        k = self.in_channels * self.temporal_patch_size * self.patch_size ** 2
+        self.linear = nn.Linear(in_features=k, out_features=self.embed_dim, bias=True, dtype=self.proj.weight.dtype)
+        
+    def copy_linear_weight_from_conv3d(self):  # call this after model loading
+        print("Copy weights from Conv3d to Linear in PatchEmbed")
+        with torch.no_grad():
+            self.linear.weight.copy_(self.proj.weight.view(self.embed_dim, -1))
+            self.linear.bias.copy_(self.proj.bias)
+        del self.proj
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.linear(hidden_states)
 
 
 class Qwen3_VisionBlock(nn.Module):
@@ -311,11 +343,13 @@ class Qwen3VLMoeVisionModel(nn.Module):
 
     @property
     def dtype(self) -> torch.dtype:
-        return self.patch_embed.proj.weight.dtype
+        # return self.patch_embed.proj.weight.dtype  # wili
+        return self.patch_embed.linear.weight.dtype  # wili
 
     @property
     def device(self) -> torch.device:
-        return self.patch_embed.proj.weight.device
+        # return self.patch_embed.proj.weight.device  # wili
+		return self.patch_embed.linear.weight.device  # wili
 
     def rot_pos_emb(self, grid_thw):
         pos_ids = []

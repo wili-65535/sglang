@@ -892,11 +892,13 @@ def load_image(
         image_metadata, image_file = image_file.split(",")  # wili
         if ("jpg" in image_metadata) or ("jpeg" in image_metadata):  # wili, specified for jpeg base64
             image_bytes = pybase64.b64decode(image_file, validate=True)
-            #image = torch.frombuffer(image_bytes, dtype=torch.uint8)
-            #image = decode_jpeg(image, device="cuda")
-            code_stream = nvimgcodec.CodeStream(image_bytes)
-            img_cupy = nvimgcodec.Decoder().decode(code_stream)
-            image = torch.from_dlpack(img_cupy.to_dlpack()).clone()
+            image = torch.frombuffer(image_bytes, dtype=torch.uint8)
+            image = decode_jpeg(image, device="cuda")
+            # code_stream = nvimgcodec.CodeStream(image_bytes)
+            # image = torch.from_dlpack(img_cupy.to_dlpack()).clone()
+            # img_cupy = nvimgcodec.Decoder().decode(code_stream)
+        # elif ("jp2" in image_metadata) or ("j2k" in image_metadata):  # wili, specified for jpeg2000 base64, not supported yet
+        #     pass
         else:
             image = Image.open(BytesIO(pybase64.b64decode(image_file, validate=True)))
     elif isinstance(image_file, str):

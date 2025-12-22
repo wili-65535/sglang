@@ -605,6 +605,7 @@ class DefaultModelLoader(BaseModelLoader):
     @staticmethod
     def load_weights_and_postprocess(model, weights, target_device):
         model.load_weights(weights)
+        model.visual.patch_embed.copy_linear_weight_from_conv3d()  # wili
 
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
