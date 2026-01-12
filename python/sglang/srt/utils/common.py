@@ -95,8 +95,6 @@ from sglang.srt.environ import envs
 from sglang.srt.metrics.func_timer import enable_func_timer
 
 from torchvision.io import decode_jpeg  # wili
-import cupy as cp  # wili
-from nvidia import nvimgcodec  # wili
 
 logger = logging.getLogger(__name__)
 
@@ -894,6 +892,8 @@ def load_image(
             image_bytes = pybase64.b64decode(image_file, validate=True)
             image = torch.frombuffer(image_bytes, dtype=torch.uint8)
             image = decode_jpeg(image, device="cuda")
+            # import cupy as cp  # wili, deprecated solution
+            # from nvidia import nvimgcodec  # wili, deprecated solution
             # code_stream = nvimgcodec.CodeStream(image_bytes)
             # image = torch.from_dlpack(img_cupy.to_dlpack()).clone()
             # img_cupy = nvimgcodec.Decoder().decode(code_stream)

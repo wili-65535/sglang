@@ -194,6 +194,8 @@ from sglang.srt.utils.hf_transformers_utils import (
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
+import nvtx  # wili
+
 logger = logging.getLogger(__name__)
 
 # Test retract decode for debugging purposes
@@ -1329,7 +1331,8 @@ class Scheduler(
 
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
-            image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
+            with nvtx.annotate("_get_multimodal_inputs from handle_generate_request", color="gold"):  # wili
+                image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
 
             # The following steps are already fast, execute locally on each rank.
             # Expand a single image token into multiple dummy tokens for receiving image embeddings

@@ -49,7 +49,9 @@ from sglang.srt.models.qwen3 import Qwen3Model
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
-import torch.nn.functional as F  # wili
+import nvtx  # wili
+import os  # wili
+from vfly.utils.parallel import dit_sp_split, dit_sp_gather  # wili
 
 logger = logging.getLogger(__name__)
 
@@ -163,7 +165,7 @@ class Qwen3VLVisionPatchEmbed(nn.Module):  # wili, V3
         k = self.in_channels * self.temporal_patch_size * self.patch_size ** 2
         self.linear = nn.Linear(in_features=k, out_features=self.embed_dim, bias=True, dtype=self.proj.weight.dtype)
         
-    def copy_linear_weight_from_conv3d(self):
+    def copy_conv3d_weight_to_linear(self):
         # Call this after model loading in `sglang/srt/model_loader/loader.py: load_weights_and_postprocess()`
         print("Copy weights from Conv3d to Linear in PatchEmbed")
         with torch.no_grad():
@@ -307,6 +309,7 @@ class Qwen3VLMoeVisionModel(nn.Module):
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
         head_dim = self.hidden_size // self.num_heads
         self.rotary_pos_emb = Qwen2_5_VisionRotaryEmbedding(head_dim // 2)
+        self.enable_vfly = bool(int(os.environ.get('ENABLE_VFLY', '0')))
 
         self.blocks = nn.ModuleList(
             [
@@ -354,7 +357,7 @@ class Qwen3VLMoeVisionModel(nn.Module):
     @property
     def device(self) -> torch.device:
         # return self.patch_embed.proj.weight.device  # wili
-		return self.patch_embed.linear.weight.device  # wili
+        return self.patch_embed.linear.weight.device  # wili
 
     def rot_pos_emb(self, grid_thw):
         pos_ids = []
@@ -574,48 +577,114 @@ class Qwen3VLMoeVisionModel(nn.Module):
     ) -> torch.Tensor:
         x = x.to(device=self.device, dtype=self.dtype)
         grid_thw = grid_thw.to(device=self.device)  # wili
-        x = self.patch_embed(x)
+        with nvtx.annotate("self.patch_embed(x)", color="yellow"):  # wili
+            x = self.patch_embed(x)
+        # with nvtx.annotate("self.fast_pos_embed_interpolate(x)", color="yellow"):  # wili
+        #     pos_embeds = self.fast_pos_embed_interpolate(grid_thw)  # wili
+        with nvtx.annotate("self.fast_pos_embed_interpolate_v2(x)", color="yellow"):  # wili
+            pos_embeds = self.fast_pos_embed_interpolate_v2(grid_thw)  # wili
 
-        # pos_embeds = self.fast_pos_embed_interpolate(grid_thw)  # wili
-        pos_embeds = self.fast_pos_embed_interpolate_v2(grid_thw)  # wili
         x += pos_embeds
-        rotary_pos_emb = self.rot_pos_emb(grid_thw)
-        # rotary_pos_emb = self.rot_pos_emb_v2(grid_thw)  # wili, do not use this since sometimes it is worse than the original one
+
+        with nvtx.annotate("self.rot_pos_emb(x)", color="yellow"):  # wili
+            rotary_pos_emb = self.rot_pos_emb(grid_thw)  # wili
+        # with nvtx.annotate("self.rot_pos_emb_v2(x)", color="yellow"):  # wili
+        #     rotary_pos_emb = self.rot_pos_emb_v2(grid_thw)  # wili
 
         seq_len, _ = x.size()
         rotary_pos_emb = rotary_pos_emb.to(x.device)
 
         rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
-        position_embeddings = (emb.cos(), emb.sin())
+        position_embeddings = [emb.cos(), emb.sin()]
 
         # compute cu_seqlens
-        cu_seqlens = torch.repeat_interleave(
-            grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
-        ).cumsum(dim=0)
-        cu_seqlens = torch.cat(
-            [
-                torch.zeros(1, dtype=torch.int32, device=cu_seqlens.device),
-                cu_seqlens.to(torch.int32),
-            ]
-        )
+        with nvtx.annotate("compute cu_seqlens(x)", color="yellow"):  # wili
+            cu_seqlens = torch.repeat_interleave(
+                grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
+            ).cumsum(dim=0)
+            cu_seqlens = torch.cat(
+                [
+                    torch.zeros(1, dtype=torch.int32, device=cu_seqlens.device),
+                    cu_seqlens.to(torch.int32),
+                ]
+            )
 
-        x = x.unsqueeze(1)
+        if self.enable_vfly:  # wili
+            x = x.unsqueeze(0)
+            # print("[wili] ==== shape before dit_sp_split ====================================")
+            # print(f"{x.shape = }")
+            # print(f"{position_embeddings[0].shape = }")
+            
+            # wili, pad sequence length to be multiple of 32
+			# For example we use a input picture of 1608x828,
+			# It is resized (by `smart_resize()` in library transformers) to 1600x832 with aligned 32
+			# Then it is merged pixels (by `_preprocess()` in library transformers) to 1600/16*832/16=6500 with 16x16 per block
+			# So the the sequence length here (x.shape[1]) is 6500
+			# Using cp=8, the sequence length per worker is 6500 / 8 = 650,
+			# Noticing this line (Qwen3VLMoeVisionPatchMerger.forward, around Line 278 in this file):
+			#     x = self.norm(x.view(-1, self.hidden_size))  # here x.shape == [650, 1152], self.hidden_size == 4608
+			# So 650 / 4 = 162.5, leads to a error
+			# As a workaround, we pad the sequence 6500 to 6528 with aligned 32 right now,
+			# So 6528 / 8 / 4 = 204, OK for the PatchMerger.
 
+            seq_len = x.shape[1]
+            pad_length = int((seq_len + 31) / 32) * 32 - seq_len
+            pad_size = [x.size(i) for i in range(x.ndim)]
+            pad_size[1] = pad_length
+            x = torch.cat([x, x.new_zeros(*pad_size)], dim=1).contiguous()
+            pad_size = [position_embeddings[0].size(i) for i in range(position_embeddings[0].ndim)]
+            pad_size[0] = pad_length
+            position_embeddings[0] = torch.cat([position_embeddings[0], position_embeddings[0].new_zeros(*pad_size)], dim=0).contiguous()
+            position_embeddings[1] = torch.cat([position_embeddings[1], position_embeddings[1].new_zeros(*pad_size)], dim=0).contiguous() 
+            
+            x = dit_sp_split(x, dim=1, allow_uneven=False)  # wili, split sequence parts for distributed processing
+            position_embeddings[0] = dit_sp_split(position_embeddings[0], dim=0, allow_uneven=False)  # wili
+            position_embeddings[1] = dit_sp_split(position_embeddings[1], dim=0, allow_uneven=False)  # wili
+            
+            # print("[wili] ==== shape after dit_sp_split ====================================")
+            # print(f"{x.shape = }")
+            # print(f"{position_embeddings[0].shape = }")
+
+        else:
+            x = x.unsqueeze(1)  # wili, original code, [seq_len, batch_size=1, hidden_size]
+            # print("[wili] ==== shape before blocks ====================================")
+            # print(f"{x.shape = }")
+            # print(f"{position_embeddings[0].shape = }")
+            
         deepstack_feature_lists = []
         num_deepstack_captured = 0
         for layer_num, blk in enumerate(self.blocks):
-            x = blk(x, cu_seqlens=cu_seqlens, position_embeddings=position_embeddings)
-            if layer_num in self.deepstack_visual_indexes:
-                deepstack_feature = self.deepstack_merger_list[num_deepstack_captured](
-                    x
-                )
-                deepstack_feature_lists.append(deepstack_feature)
-                num_deepstack_captured += 1
-        x = self.merger(x)
+            with nvtx.annotate("blk", color="yellow"):  # wili
+                x = blk(x, cu_seqlens=cu_seqlens, position_embeddings=position_embeddings)
+                if layer_num in self.deepstack_visual_indexes:
+                    deepstack_feature = self.deepstack_merger_list[num_deepstack_captured](
+                        x
+                    )
+                    deepstack_feature_lists.append(deepstack_feature)
+                    num_deepstack_captured += 1
+
+        with nvtx.annotate("x = self.merger(x)", color="yellow"):  # wili
+            x = self.merger(x)
         hidden_states = torch.cat(
             [x] + deepstack_feature_lists, dim=1
         )  # [seq_len, hidden_size * (1 + depth_of_deepstack)]
+	
+        if self.enable_vfly:  # wili
+            hidden_states = hidden_states.unsqueeze(0)  # wili, [batch_size=1, seq_len, hidden_size * (1 + depth_of_deepstack)]
+            # print("[wili] ==== shape before dit_sp_gather ====================================")
+            # print(f"{hidden_states.shape = }")
+            
+            hidden_states = dit_sp_gather(hidden_states, dim=1)  # wili, gather sequence parts back
+            
+            # print("[wili] ==== shape after dit_sp_gather ====================================")
+            # print(f"{hidden_states.shape = }")
+        else:
+            pass
+            # print("[wili] ==== shape after blocks ====================================")
+            # print(f"{hidden_states.shape = }")
+            
+            
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -809,7 +878,17 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
-        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+
+        # start = torch.cuda.Event(enable_timing=True)  # wili
+        # end   = torch.cuda.Event(enable_timing=True)  # wili
+        # torch.cuda.synchronize()  # wili
+        # start.record()  # wili
+        with nvtx.annotate("VisionModel", color="green"):  # wili
+            image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+        # end.record()  # wili
+        # torch.cuda.synchronize()  # wili
+        # elapsed_ms = start.elapsed_time(end)  # wili
+        # print(f"VisionModel,{elapsed_ms=:.3f}ms")  # wili
         return image_embeds
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
@@ -929,5 +1008,75 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 
+    def enable_vision_fly(self):  # wili
+        # Copy from /work/qwen3-vl/third_party/VisionFly/examples/qwenimage.py
+        import torch
+        from .common import BaseArgumentParser, create_vfly_config, validate_parallel_config
+        from vfly import setup_configs
+        from vfly.layers import VflyAttnProcessor, apply_vfly_linear, apply_vfly_norm
+        from vfly.utils import get_logger
+
+        logger = get_logger(__name__)
+
+        class VflyQwenDoubleStreamAttnProcessor2_0(VflyAttnProcessor):
+            def __init__(self):
+                super().__init__()
+                logger.debug("VflyQwenDoubleStreamAttnProcessor2_0 initialized")
+
+            def __call__(self, q: torch.FloatTensor, k: torch.FloatTensor, v: torch.FloatTensor) -> torch.FloatTensor:
+                return self.vfly_attn(q, k, v, tensor_layout="NHD")
+
+        # Setup argument parser
+        parser = BaseArgumentParser("")
+        parser.set_defaults(
+            model_path="",
+            prompt="",
+            negative_prompt=" ",
+            width=256,
+            height=256,
+            num_inference_steps=50,
+            true_cfg_scale=4.0,
+            random_seed=42,
+            cp=8,
+            # ulysses=8,
+            # ring=8,
+        )
+        args = parser.parse_args([])
+
+        enable_autotuner = False
+        if args.linear_type == "auto" or args.attn_type == "auto":
+            enable_autotuner = True
+            if not args.disable_torch_compile:
+                logger.warning("Disable torch compile when using autotuner")
+                args.disable_torch_compile = True
+            if args.enable_vfly_cpu_offload:
+                logger.warning("Disable vfly cpu offload when using autotuner")
+                args.enable_vfly_cpu_offload = False
+
+        # Validate configuration
+        validate_parallel_config(args)
+
+        # Load pipeline
+        vfly_configs = create_vfly_config(args)
+        setup_configs(**vfly_configs)
+
+        pipe = self.visual
+        for name, module in pipe.blocks.named_modules():
+            if isinstance(module, VisionAttention):
+                attn_processor = VflyQwenDoubleStreamAttnProcessor2_0()
+                attn_processor.name = name
+                module.processor = attn_processor
+        apply_vfly_linear(pipe, load_parameters=True)
+        apply_vfly_norm(
+            pipe,
+            rmsnorm=["norm_q", "norm_k", "norm_added_q", "norm_added_k"],
+            load_parameters=True,
+        )
+
+        """
+        if not args.disable_torch_compile:
+            self.visual = torch.compile(self.visual, mode=args.torch_compile_mode)
+        """
+        return
 
 EntryClass = Qwen3VLForConditionalGeneration

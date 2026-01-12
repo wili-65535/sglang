@@ -27,6 +27,8 @@ from sglang.srt.utils.cuda_ipc_transport_utils import (
     MmItemMemoryPool,
 )
 
+import nvtx  # wili
+
 _is_npu = is_npu()
 
 SGL_USE_CUDA_IPC = get_bool_env_var("SGLANG_USE_CUDA_IPC_TRANSPORT")
@@ -264,12 +266,13 @@ class BaseMultimodalProcessor(ABC):
             }:
                 # Note: for qwen-vl, processor has some reshape issue because of dims restriction on Ascend.
                 kwargs["device"] = "npu"
-        result = processor.__call__(
-            text=[input_text],
-            padding=True,
-            return_tensors="pt",
-            **kwargs,
-        )
+        with nvtx.annotate("result = processor.__call__(", color="red"):  # wili
+            result = processor.__call__(
+                text=[input_text],
+                padding=True,
+                return_tensors="pt",
+                **kwargs,
+            )
         if not self.server_args.keep_mm_feature_on_device:
             # move feature tensors to cpu
             for feature_name in self.FEATURE_NAMES:
@@ -336,7 +339,8 @@ class BaseMultimodalProcessor(ABC):
             return data
         try:
             if modality == Modality.IMAGE:
-                img, _ = load_image(data)
+                with nvtx.annotate("load_image", color="green"):  # wili
+                    img, _ = load_image(data)
                 #if discard_alpha_channel and img.mode != "RGB":  # wili
                 if discard_alpha_channel and img.mode != "RGB" and not isinstance(img, torch.Tensor):  # wili
                     img = img.convert("RGB")
@@ -604,8 +608,10 @@ class BaseMultimodalProcessor(ABC):
             input_text=input_text, images=images, audios=audios, videos=videos, **kwargs
         )
 
-        input_ids = ret["input_ids"].flatten()
-        collected_items = self.collect_mm_items_from_processor_output(ret)
+        with nvtx.annotate('ret["input_ids"].flatten()', color="green"):  # wili
+            input_ids = ret["input_ids"].flatten()
+        with nvtx.annotate("collect_mm_items_from_processor_output", color="green"):  # wili
+            collected_items = self.collect_mm_items_from_processor_output(ret)
 
         return collected_items, input_ids, ret
 
@@ -677,14 +683,15 @@ class BaseMultimodalProcessor(ABC):
             ).input_ids.flatten()
 
         # Add offsets to all items
-        for mm_item in all_collected_items:
-            mm_token_id = mm_tokens.get_token_id_by_modality(mm_item.modality)
-            if mm_token_id is None:
-                raise ValueError(f"No token id found for modality: {mm_item.modality}")
-            mm_item.offsets = self.get_mm_items_offset(
-                input_ids=input_ids,
-                mm_token_id=mm_token_id,
-            )
+        with nvtx.annotate("compute mm offset", color="green"):  # wili
+            for mm_item in all_collected_items:
+                mm_token_id = mm_tokens.get_token_id_by_modality(mm_item.modality)
+                if mm_token_id is None:
+                    raise ValueError(f"No token id found for modality: {mm_item.modality}")
+                mm_item.offsets = self.get_mm_items_offset(
+                    input_ids=input_ids,
+                    mm_token_id=mm_token_id,
+                )
 
         """
         solution for cuda-ipc memory-leak:
@@ -696,41 +703,42 @@ class BaseMultimodalProcessor(ABC):
 
         if SGL_USE_CUDA_IPC:
             # post-process
-            for item in all_collected_items:
-                if isinstance(item.feature, torch.Tensor) and item.feature.is_cuda:
-                    sync_flag, available_slice = (
-                        self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(
-                            item.feature
+            with nvtx.annotate("SGL_USE_CUDA_IPC", color="green"):  # wili
+                for item in all_collected_items:
+                    if isinstance(item.feature, torch.Tensor) and item.feature.is_cuda:
+                        sync_flag, available_slice = (
+                            self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(
+                                item.feature
+                            )
                         )
-                    )
-                    if isinstance(available_slice, torch.Tensor):
-                        available_slice.copy_(
-                            item.feature.view(torch.int8).view(-1), non_blocking=True
-                        )
-                        item.feature = CudaIpcTensorTransportProxy(
-                            data=available_slice,
-                            info_data=item.feature,
-                            sync_buffer_meta=sync_flag,
-                        )
-                elif (
-                    isinstance(item.precomputed_embeddings, torch.Tensor)
-                    and item.precomputed_embeddings.is_cuda
-                ):
+                        if isinstance(available_slice, torch.Tensor):
+                            available_slice.copy_(
+                                item.feature.view(torch.int8).view(-1), non_blocking=True
+                            )
+                            item.feature = CudaIpcTensorTransportProxy(
+                                data=available_slice,
+                                info_data=item.feature,
+                                sync_buffer_meta=sync_flag,
+                            )
+                    elif (
+                        isinstance(item.precomputed_embeddings, torch.Tensor)
+                        and item.precomputed_embeddings.is_cuda
+                    ):
 
-                    sync_flag, available_slice = (
-                        self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(
-                            item.precomputed_embeddings
+                        sync_flag, available_slice = (
+                            self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(
+                                item.precomputed_embeddings
+                            )
                         )
-                    )
-                    if isinstance(available_slice, torch.Tensor):
-                        available_slice.copy_(
-                            item.precomputed_embeddings.view(torch.int8).view(-1),
-                            non_blocking=True,
-                        )
-                        item.precomputed_embeddings = CudaIpcTensorTransportProxy(
-                            data=available_slice,
-                            info_data=item.precomputed_embeddings,
-                            sync_buffer_meta=sync_flag,
-                        )
+                        if isinstance(available_slice, torch.Tensor):
+                            available_slice.copy_(
+                                item.precomputed_embeddings.view(torch.int8).view(-1),
+                                non_blocking=True,
+                            )
+                            item.precomputed_embeddings = CudaIpcTensorTransportProxy(
+                                data=available_slice,
+                                info_data=item.precomputed_embeddings,
+                                sync_buffer_meta=sync_flag,
+                            )
 
         return all_collected_items, input_ids, ret

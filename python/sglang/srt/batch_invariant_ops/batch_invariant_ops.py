@@ -268,7 +268,7 @@ def matmul_persistent(
     K, N = b.shape
 
     # DeepGEMM has minimum dimension requirements for TMA descriptors
-    MIN_DEEPGEMM_DIM = 16
+    MIN_DEEPGEMM_DIM = 2048  # wili, default value is 16, but need to set to 2048 to match SGLANG's min dim for DeepGEMM
 
     if (
         _ENABLE_MM_DEEPGEMM
