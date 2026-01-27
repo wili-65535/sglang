@@ -491,9 +491,13 @@ class VisionAttention(nn.Module):
         **kwargs,
     ):
         super().__init__()
-        self.enable_vfly = bool(int(os.environ.get('ENABLE_VFLY', '0')))
-        attn_tp_rank = get_attention_tp_rank()
-        attn_tp_size = get_attention_tp_size()
+        self.enable_vfly = bool(int(os.environ.get('ENABLE_VFLY', '0')))  # wili
+        if self.enable_vfly:  # wili, reuse TP group but keep TP size as 1
+            attn_tp_rank = 0
+            attn_tp_size = 1
+        else:  # wili, original code
+            attn_tp_rank = get_attention_tp_rank()
+            attn_tp_size = get_attention_tp_size()
         self.tp_size = attn_tp_size
         self.tp_rank = attn_tp_rank
         self.dropout = dropout
@@ -725,7 +729,7 @@ class VisionAttention(nn.Module):
             q = q.unsqueeze(0)  # wili, vfly needs input as [batch_size, sequence_length, num_head, head_dim]
             k = k.unsqueeze(0)
             v = v.unsqueeze(0)
-            output = self.processor(q, k, v)
+            output = self.processor(q, k, v, cu_seqlens)
             output = output[0]
         else:
             output = self.qkv_backend.forward(  # Original attention

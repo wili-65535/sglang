@@ -386,7 +386,7 @@ def _get_chunked_prefill_embedding(
 	        item_hashes = [item.hash for item in embedding_items_per_req]
 	        embedding_items_hash = MultiModalStaticCache.combine_hashes(item_hashes)
 	        embedding_per_req = embedding_cache.get(item_hashes)
-        else:  # wili, disable the iamge cache
+        else:  # wili, disable the image cache for benchmark
             item_hashes = [item.hash for item in embedding_items_per_req]
             embedding_items_hash = MultiModalStaticCache.combine_hashes(item_hashes)
             embedding_per_req = None

@@ -77,6 +77,8 @@ class Qwen3_VisionMLP(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("linear_fc1", prefix),
+            tp_rank = 0,  # wili, reuse TP group but keep TP size as 1
+            tp_size = 1,  # wili
         )
         self.linear_fc2 = RowParallelLinear(
             hidden_features,
@@ -84,6 +86,8 @@ class Qwen3_VisionMLP(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("linear_fc2", prefix),
+            tp_rank = 0,  # wili, reuse TP group but keep TP size as 1
+            tp_size = 1,  # wili
         )
         self.act = ACT2FN[hidden_act]
 
@@ -263,6 +267,8 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
             bias=True,
             quant_config=quant_config,
             prefix=add_prefix("linear_fc1", prefix),
+            tp_rank = 0,  # wili, reuse TP group but keep TP size as 1
+            tp_size = 1,  # wili
         )
         self.act_fn = nn.GELU()
         self.linear_fc2 = RowParallelLinear(
@@ -271,6 +277,8 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
             bias=True,
             quant_config=quant_config,
             prefix=add_prefix("linear_fc2", prefix),
+            tp_rank = 0,  # wili, reuse TP group but keep TP size as 1
+            tp_size = 1,  # wili
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -600,58 +608,41 @@ class Qwen3VLMoeVisionModel(nn.Module):
 
         # compute cu_seqlens
         with nvtx.annotate("compute cu_seqlens(x)", color="yellow"):  # wili
-            cu_seqlens = torch.repeat_interleave(
-                grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
-            ).cumsum(dim=0)
-            cu_seqlens = torch.cat(
-                [
-                    torch.zeros(1, dtype=torch.int32, device=cu_seqlens.device),
-                    cu_seqlens.to(torch.int32),
-                ]
-            )
+            seq_lens_list = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0])  # wili
+            cu_seqlens = seq_lens_list.cumsum(dim=0)
+            cu_seqlens = torch.cat([
+                torch.zeros(1, dtype=torch.int32, device=cu_seqlens.device),
+                cu_seqlens.to(torch.int32),
+            ])
+
+        x = x.unsqueeze(1)  # wili, [seq_len, batch_size=1, hidden_size], transpose to [batch_size, seq_len, hidden_size] in Qwen3_VisionBlock just before attention
 
         if self.enable_vfly:  # wili
-            x = x.unsqueeze(0)
-            # print("[wili] ==== shape before dit_sp_split ====================================")
-            # print(f"{x.shape = }")
-            # print(f"{position_embeddings[0].shape = }")
-            
             # wili, pad sequence length to be multiple of 32
-			# For example we use a input picture of 1608x828,
-			# It is resized (by `smart_resize()` in library transformers) to 1600x832 with aligned 32
-			# Then it is merged pixels (by `_preprocess()` in library transformers) to 1600/16*832/16=6500 with 16x16 per block
-			# So the the sequence length here (x.shape[1]) is 6500
-			# Using cp=8, the sequence length per worker is 6500 / 8 = 650,
-			# Noticing this line (Qwen3VLMoeVisionPatchMerger.forward, around Line 278 in this file):
-			#     x = self.norm(x.view(-1, self.hidden_size))  # here x.shape == [650, 1152], self.hidden_size == 4608
-			# So 650 / 4 = 162.5, leads to a error
-			# As a workaround, we pad the sequence 6500 to 6528 with aligned 32 right now,
-			# So 6528 / 8 / 4 = 204, OK for the PatchMerger.
-
-            seq_len = x.shape[1]
+            # For example we use a picture of 1608x828 as input,
+            # It is resize (by `smart_resize()` in library transformers) to 1600x832 with aligned 32
+            # Then it is merged pixels (by `_preprocess()` in library transformers) to sequence length of 1600/16*832/16=5200 with 16x16 per a block
+            # So the the sequence length here (x.shape[1]) is 5200
+            # Using cp=8, the sequence length per worker will be 5200 / 8 = 650,
+            # Noticing this line (Qwen3VLMoeVisionPatchMerger.forward, around Line 278 in this file):
+            #     x = self.norm(x.view(-1, self.hidden_size))  # here x.shape == [650, 1152], self.hidden_size == 4608
+            # So 650 / 4 = 162.5, leads to a error
+            # As a workaround, we pad the sequence 5200 to 5216 here with aligned 32,
+            # So 5216 / 8 / 4 = 163, OK for the PatchMerger.
+            seq_len = x.shape[0]
             pad_length = int((seq_len + 31) / 32) * 32 - seq_len
             pad_size = [x.size(i) for i in range(x.ndim)]
-            pad_size[1] = pad_length
-            x = torch.cat([x, x.new_zeros(*pad_size)], dim=1).contiguous()
+            pad_size[0] = pad_length
+            x = torch.cat([x, x.new_zeros(*pad_size)], dim=0).contiguous()
             pad_size = [position_embeddings[0].size(i) for i in range(position_embeddings[0].ndim)]
             pad_size[0] = pad_length
             position_embeddings[0] = torch.cat([position_embeddings[0], position_embeddings[0].new_zeros(*pad_size)], dim=0).contiguous()
-            position_embeddings[1] = torch.cat([position_embeddings[1], position_embeddings[1].new_zeros(*pad_size)], dim=0).contiguous() 
-            
-            x = dit_sp_split(x, dim=1, allow_uneven=False)  # wili, split sequence parts for distributed processing
-            position_embeddings[0] = dit_sp_split(position_embeddings[0], dim=0, allow_uneven=False)  # wili
-            position_embeddings[1] = dit_sp_split(position_embeddings[1], dim=0, allow_uneven=False)  # wili
-            
-            # print("[wili] ==== shape after dit_sp_split ====================================")
-            # print(f"{x.shape = }")
-            # print(f"{position_embeddings[0].shape = }")
+            position_embeddings[1] = torch.cat([position_embeddings[1], position_embeddings[1].new_zeros(*pad_size)], dim=0).contiguous()
 
-        else:
-            x = x.unsqueeze(1)  # wili, original code, [seq_len, batch_size=1, hidden_size]
-            # print("[wili] ==== shape before blocks ====================================")
-            # print(f"{x.shape = }")
-            # print(f"{position_embeddings[0].shape = }")
-            
+            x = dit_sp_split(x, dim=0)  # wili, split sequence parts for distributed processing
+            position_embeddings[0] = dit_sp_split(position_embeddings[0], dim=0)  # wili
+            position_embeddings[1] = dit_sp_split(position_embeddings[1], dim=0)  # wili
+
         deepstack_feature_lists = []
         num_deepstack_captured = 0
         for layer_num, blk in enumerate(self.blocks):
@@ -669,22 +660,14 @@ class Qwen3VLMoeVisionModel(nn.Module):
         hidden_states = torch.cat(
             [x] + deepstack_feature_lists, dim=1
         )  # [seq_len, hidden_size * (1 + depth_of_deepstack)]
-	
+
         if self.enable_vfly:  # wili
             hidden_states = hidden_states.unsqueeze(0)  # wili, [batch_size=1, seq_len, hidden_size * (1 + depth_of_deepstack)]
-            # print("[wili] ==== shape before dit_sp_gather ====================================")
-            # print(f"{hidden_states.shape = }")
-            
+
             hidden_states = dit_sp_gather(hidden_states, dim=1)  # wili, gather sequence parts back
             
-            # print("[wili] ==== shape after dit_sp_gather ====================================")
-            # print(f"{hidden_states.shape = }")
-        else:
-            pass
-            # print("[wili] ==== shape after blocks ====================================")
-            # print(f"{hidden_states.shape = }")
-            
-            
+            hidden_states = hidden_states.squeeze(0)
+
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -1010,39 +993,63 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
     def enable_vision_fly(self):  # wili
         # Copy from /work/qwen3-vl/third_party/VisionFly/examples/qwenimage.py
-        import torch
         from .common import BaseArgumentParser, create_vfly_config, validate_parallel_config
         from vfly import setup_configs
         from vfly.layers import VflyAttnProcessor, apply_vfly_linear, apply_vfly_norm
         from vfly.utils import get_logger
+        from vfly.configs.parallel import get_dit_parallel_config, DiTParallelConfig
+        from vfly.configs.pipeline import PipelineConfig
 
         logger = get_logger(__name__)
 
         class VflyQwenDoubleStreamAttnProcessor2_0(VflyAttnProcessor):
+
             def __init__(self):
                 super().__init__()
                 logger.debug("VflyQwenDoubleStreamAttnProcessor2_0 initialized")
 
-            def __call__(self, q: torch.FloatTensor, k: torch.FloatTensor, v: torch.FloatTensor) -> torch.FloatTensor:
-                return self.vfly_attn(q, k, v, tensor_layout="NHD")
+            def __call__(
+                self,
+                q: torch.FloatTensor,
+                k: torch.FloatTensor,
+                v: torch.FloatTensor,
+                cu_seqlens: torch.IntTensor,
+            ) -> torch.FloatTensor:
+                pfg = get_dit_parallel_config()
+                world_size = pfg.ulysses_size()  # Only ulysses is supported
+
+                max_seqlen = torch.max(cu_seqlens.diff())
+                total_seq_len = torch.sum(seq_lens_list).item()
+                seq_len_padded = (total_seq_len + world_size - 1) // world_size * world_size
+                uneven_number = seq_len_padded - total_seq_len
+                seq_len_cur_rank = q.shape[1]
+                if torch.distributed.get_rank() == world_size - 1:
+                    seq_len_cur_rank = seq_len_cur_rank - uneven_number
+
+                parallel_config = DiTParallelConfig()
+                parallel_config.set_config(
+                    cfg_size=pfg.cp_size(),
+                    ulysses_size=pfg.ulysses_size(),
+                    ring_size=pfg.ring_size(),
+                )
+                PipelineConfig.set_uneven_cp_config(total_seq_len, seq_len_padded, seq_len_cur_rank, parallel_config)
+
+                return self.vfly_attn(
+                    q,
+                    k,
+                    v,
+                    tensor_layout="NHD",
+                    cu_seqlens_q=cu_seqlens,
+                    cu_seqlens_k=cu_seqlens.clone(),
+                    max_seqlen_q=max_seqlen,
+                    max_seqlen_k=max_seqlen,
+                )
 
         # Setup argument parser
         parser = BaseArgumentParser("")
-        parser.set_defaults(
-            model_path="",
-            prompt="",
-            negative_prompt=" ",
-            width=256,
-            height=256,
-            num_inference_steps=50,
-            true_cfg_scale=4.0,
-            random_seed=42,
-            cp=8,
-            # ulysses=8,
-            # ring=8,
-        )
+        parser.set_defaults(ulysses=torch.distributed.get_world_size(), attn_type="flash-attn3")
         args = parser.parse_args([])
-
+        """
         enable_autotuner = False
         if args.linear_type == "auto" or args.attn_type == "auto":
             enable_autotuner = True
@@ -1052,7 +1059,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             if args.enable_vfly_cpu_offload:
                 logger.warning("Disable vfly cpu offload when using autotuner")
                 args.enable_vfly_cpu_offload = False
-
+        """
         # Validate configuration
         validate_parallel_config(args)
 
@@ -1072,7 +1079,6 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             rmsnorm=["norm_q", "norm_k", "norm_added_q", "norm_added_k"],
             load_parameters=True,
         )
-
         """
         if not args.disable_torch_compile:
             self.visual = torch.compile(self.visual, mode=args.torch_compile_mode)

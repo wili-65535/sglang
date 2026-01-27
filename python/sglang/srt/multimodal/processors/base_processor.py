@@ -266,7 +266,6 @@ class BaseMultimodalProcessor(ABC):
             }:
                 # Note: for qwen-vl, processor has some reshape issue because of dims restriction on Ascend.
                 kwargs["device"] = "npu"
-        with nvtx.annotate("result = processor.__call__(", color="red"):  # wili
             result = processor.__call__(
                 text=[input_text],
                 padding=True,
