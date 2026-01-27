@@ -1018,8 +1018,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 pfg = get_dit_parallel_config()
                 world_size = pfg.ulysses_size()  # Only ulysses is supported
 
-                max_seqlen = torch.max(cu_seqlens.diff())
-                total_seq_len = torch.sum(seq_lens_list).item()
+                seq_lens_list = cu_seqlens.diff()
+                max_seqlen = torch.max(seq_lens_list)
+                total_seq_len = cu_seqlens[-1].item()
                 seq_len_padded = (total_seq_len + world_size - 1) // world_size * world_size
                 uneven_number = seq_len_padded - total_seq_len
                 seq_len_cur_rank = q.shape[1]
