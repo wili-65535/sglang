@@ -431,7 +431,12 @@ class BaseMultimodalProcessor(ABC):
         try:
             if modality == Modality.IMAGE:
                 img, _ = load_image(data)
-                if discard_alpha_channel and img.mode != "RGB":
+                if (
+                    discard_alpha_channel
+                    and img.mode != "RGB"
+                    and not isinstance(img, torch.Tensor)
+                ):
+                    # Needed only when `img` is a PIL image
                     img = img.convert("RGB")
                 return img
             elif modality == Modality.VIDEO:
