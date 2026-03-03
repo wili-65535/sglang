@@ -407,10 +407,16 @@ class Qwen3OmniMoeVisionEncoder(Qwen3VLMoeVisionModel):
 
     @property
     def dtype(self) -> torch.dtype:
+        # After Conv3d to Linear conversion, self.proj is deleted and
+        # self.linear takes its place.
+        if hasattr(self.patch_embed, "linear"):
+            return self.patch_embed.linear.weight.dtype
         return self.patch_embed.proj.weight.dtype
 
     @property
     def device(self) -> torch.device:
+        if hasattr(self.patch_embed, "linear"):
+            return self.patch_embed.linear.weight.device
         return self.patch_embed.proj.weight.device
 
 
@@ -657,6 +663,7 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
                         logger.warning(
                             f"Loaded weight with {name=} not found in params_dict"
                         )
+        self.thinker.visual.patch_embed.copy_conv3d_weight_to_linear()
 
 
 EntryClass = Qwen3OmniMoeForConditionalGeneration

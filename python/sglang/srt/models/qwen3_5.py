@@ -1180,6 +1180,9 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
+
+        self.visual.patch_embed.copy_conv3d_weight_to_linear()
+
         return loaded_params
 
 
@@ -1413,6 +1416,8 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 if isinstance(layer.mlp, Qwen2MoeSparseMoeBlock)
             }
         )
+
+        self.visual.patch_embed.copy_conv3d_weight_to_linear()
 
         return loaded_params
 

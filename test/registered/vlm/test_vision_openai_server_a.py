@@ -48,6 +48,23 @@ class TestQwen3OmniServer(OmniOpenAITestMixin):
     ]
 
 
+class TestQwen35Server(ImageOpenAITestMixin, VideoOpenAITestMixin):
+    # Test Qwen3_5ForConditionalGeneration
+    model = "Qwen/Qwen3.5-9B"
+    extra_args = ["--cuda-graph-max-bs=4"]
+
+
+class TestQwen35MoeServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
+    # Test Qwen3_5MoeForConditionalGeneration
+    model = "Qwen/Qwen3.5-35B-A3B"
+    extra_args = [  # workaround to fit into H100
+        "--mem-fraction-static=0.90",
+        "--disable-cuda-graph",
+        "--disable-fast-image-processor",
+        "--grammar-backend=none",
+    ]
+
+
 class TestQwen2VLContextLengthServer(CustomTestCase):
     @classmethod
     def setUpClass(cls):
