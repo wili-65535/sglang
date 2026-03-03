@@ -135,20 +135,26 @@ class Qwen3VLVisionPatchEmbed(nn.Module):
             stride=kernel_size,
             bias=True,
         )
+        k = self.in_channels * self.temporal_patch_size * self.patch_size**2
+        self.linear = nn.Linear(
+            in_features=k,
+            out_features=self.embed_dim,
+            bias=True,
+            dtype=self.proj.weight.dtype,
+        )
+
+    def copy_conv3d_weight_to_linear(self):
+        # Call this after weight loading
+        with torch.no_grad():
+            self.linear.weight.copy_(self.proj.weight.view(self.embed_dim, -1))
+            self.linear.bias.copy_(self.proj.bias)
+        del self.proj
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        target_dtype = self.proj.weight.dtype
-        hidden_states = hidden_states.view(
-            -1,
-            self.in_channels,
-            self.temporal_patch_size,
-            self.patch_size,
-            self.patch_size,
-        )
-        hidden_states = self.proj(hidden_states.to(dtype=target_dtype)).view(
-            -1, self.embed_dim
-        )
-        return hidden_states
+        # After copy_conv3d_weight_to_linear(), self.linear exists and
+        # self.proj has been deleted.  Input x is already 2-D:
+        #   (num_patches, C * T * P * P)
+        return self.linear(hidden_states)
 
 
 class Qwen3_VisionBlock(nn.Module):
@@ -394,10 +400,16 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
 
     @property
     def dtype(self) -> torch.dtype:
+        # After Conv3d to Linear conversion, self.proj is deleted and
+        # self.linear takes its place.
+        if hasattr(self.patch_embed, "linear"):
+            return self.patch_embed.linear.weight.dtype
         return self.patch_embed.proj.weight.dtype
 
     @property
     def device(self) -> torch.device:
+        if hasattr(self.patch_embed, "linear"):
+            return self.patch_embed.linear.weight.device
         return self.patch_embed.proj.weight.device
 
     def rot_pos_emb(
@@ -888,6 +900,8 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
+
+        self.patch_embed.copy_conv3d_weight_to_linear()
         return loaded_params
 
 
