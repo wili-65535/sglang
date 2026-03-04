@@ -509,48 +509,48 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         num_grid_per_side = self.num_grid_per_side
         m_size = self.spatial_merge_size
         hidden_dim = self.pos_embed.embedding_dim
+        device = self.device
 
         outputs = []
         for t, h, w in grid_thw:
-            h_idxs = torch.linspace(
-                0, num_grid_per_side - 1, h, dtype=torch.float32, device=self.device
-            )
-            w_idxs = torch.linspace(
-                0, num_grid_per_side - 1, w, dtype=torch.float32, device=self.device
-            )
+            h_idxs = np.linspace(0, num_grid_per_side - 1, h, dtype=np.float32)
+            w_idxs = np.linspace(0, num_grid_per_side - 1, w, dtype=np.float32)
 
-            h_floor = h_idxs.to(torch.long)
-            w_floor = w_idxs.to(torch.long)
-            h_ceil = torch.clamp(h_floor + 1, max=num_grid_per_side - 1)
-            w_ceil = torch.clamp(w_floor + 1, max=num_grid_per_side - 1)
+            h_floor = np.floor(h_idxs).astype(np.int64)
+            w_floor = np.floor(w_idxs).astype(np.int64)
+            h_ceil = np.clip(h_floor + 1, 0, num_grid_per_side - 1)
+            w_ceil = np.clip(w_floor + 1, 0, num_grid_per_side - 1)
 
             dh = h_idxs - h_floor
             dw = w_idxs - w_floor
 
-            # Create meshgrid view for all h, w vars
-            dh_grid, dw_grid = torch.meshgrid(dh, dw, indexing="ij")
-            h_floor_grid, w_floor_grid = torch.meshgrid(h_floor, w_floor, indexing="ij")
-            h_ceil_grid, w_ceil_grid = torch.meshgrid(h_ceil, w_ceil, indexing="ij")
+            dh_col = dh[:, None]
+            dw_row = dw[None, :]
 
-            # original computation of weights
-            # w00 = (1 - dh_grid) * (1 - dw_grid)
-            # w01 = (1 - dh_grid) * dw_grid
-            # w10 = dh_grid * (1 - dw_grid)
-            # w11 = dh_grid * dw_grid
-            # we reuse w11 here to avoid duplicate
-            # dh_grid * dw_grid computation
-            w11 = dh_grid * dw_grid
-            w10 = dh_grid - w11
-            w01 = dw_grid - w11
-            w00 = 1 - dh_grid - w01
+            w11 = dh_col * dw_row
+            w10 = dh_col - w11
+            w01 = dw_row - w11
+            w00 = 1.0 - dh_col - w01
 
-            h_grid = torch.stack([h_floor_grid, h_floor_grid, h_ceil_grid, h_ceil_grid])
-            w_grid = torch.stack([w_floor_grid, w_ceil_grid, w_floor_grid, w_ceil_grid])
-            h_grid_idx = h_grid * num_grid_per_side
+            h_floor_col = h_floor[:, None]
+            h_ceil_col = h_ceil[:, None]
+            w_floor_row = w_floor[None, :]
+            w_ceil_row = w_ceil[None, :]
 
-            indices = (h_grid_idx + w_grid).reshape(4, -1)
-            weights = torch.stack([w00, w01, w10, w11], dim=0).reshape(4, -1, 1)
-            weights = weights.to(dtype=self.dtype)
+            idx00 = (h_floor_col * num_grid_per_side + w_floor_row).reshape(-1)
+            idx01 = (h_floor_col * num_grid_per_side + w_ceil_row).reshape(-1)
+            idx10 = (h_ceil_col * num_grid_per_side + w_floor_row).reshape(-1)
+            idx11 = (h_ceil_col * num_grid_per_side + w_ceil_row).reshape(-1)
+
+            indices_np = np.stack([idx00, idx01, idx10, idx11], axis=0)
+            weights_np = np.stack([w00, w01, w10, w11], axis=0).reshape(4, -1, 1)
+
+            indices = torch.from_numpy(indices_np).to(
+                device=device, dtype=torch.long, non_blocking=True
+            )
+            weights = torch.from_numpy(weights_np).to(
+                device=device, dtype=self.dtype, non_blocking=True
+            )
 
             embeds = self.pos_embed(indices)
             embeds *= weights
@@ -737,6 +737,21 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         x += pos_embeds
 
         rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw_list)
+        """
+        for _ in range(10):
+            rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw_list)
+        rotary_pos_emb_start = torch.cuda.Event(enable_timing=True)
+        rotary_pos_emb_end = torch.cuda.Event(enable_timing=True)
+        torch.cuda.synchronize(x.device)
+        rotary_pos_emb_start.record()
+        for _ in range(30):
+            #with nvtx.annotate("rot_pos", color="purple"):
+                rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw_list)
+        rotary_pos_emb_end.record()
+        torch.cuda.synchronize(x.device)
+        rotary_pos_emb_elapsed_ms = rotary_pos_emb_start.elapsed_time(rotary_pos_emb_end) / 30
+        print(f"### rot_pos {x.shape[0]:4d}: {rotary_pos_emb_elapsed_ms:.3f} ms")
+        """
 
         # ---- build token indptr (B+1,) ----
         token_cu_seqlens = np.repeat(
