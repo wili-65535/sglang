@@ -1466,6 +1466,14 @@ def get_new_expanded_mm_items(original_mm_items):
         if is_bundled:
             num_items = len(item.offsets)
 
+            # Backup if the feature is a CudaIpcTensorTransportProxy and make it behave like a normal tensor
+            item_feature_backup = None
+            if isinstance(item.feature, CudaIpcTensorTransportProxy):
+                item_feature_backup = item.feature
+                item.feature = item.feature.reconstruct_on_target_device(
+                    torch.cuda.current_device()
+                )
+
             if item.is_image():
                 image_grid_thw = item.model_specific_data.get("image_grid_thw")
                 grid_len = _get_length(image_grid_thw)
@@ -1606,6 +1614,10 @@ def get_new_expanded_mm_items(original_mm_items):
                     expanded_mm_items.append(new_item)
             else:
                 expanded_mm_items.append(item)
+
+            # Restore the feature if it is a CudaIpcTensorTransportProxy
+            if item_feature_backup is not None:
+                item.feature = item_feature_backup
 
         else:
             expanded_mm_items.append(item)
