@@ -928,9 +928,14 @@ class ImageData:
 image_extension_names = (".png", ".jpg", ".jpeg", ".webp", ".gif")
 
 
-def is_jpeg_with_cuda(image_bytes: bytes = b"") -> bool:
-    """Check whether CUDA is available and input is recognized as JPEG."""
-    if not is_cuda():
+def is_jpeg_with_cuda(image_bytes: bytes = b"", gpu_image_decode: bool = True) -> bool:
+    """
+    Check three conditions:
+    1. whether CUDA is available.
+    2. whether input is recognized as JPEG.
+    3. whether GPU image decode is enabled (some models such as CPM forcibly disable this).
+    """
+    if not is_cuda() or not gpu_image_decode:
         return False
     if image_bytes != b"":
         return image_bytes.startswith(b"\xff\xd8") and image_bytes.endswith(b"\xff\xd9")
@@ -938,7 +943,9 @@ def is_jpeg_with_cuda(image_bytes: bytes = b"") -> bool:
 
 
 def _load_image(
-    image_bytes: bytes = b"", image_file: str = ""
+    image_bytes: bytes = b"",
+    image_file: str = "",
+    gpu_image_decode: bool = True,
 ) -> Union[torch.Tensor, Image.Image]:
     """
     Try to decode JPEG with nvJPEG on GPU and return a torch device tensor,
@@ -947,7 +954,7 @@ def _load_image(
     """
     if image_file != "":
         image_bytes = get_image_bytes(image_file)
-    if is_jpeg_with_cuda(image_bytes):
+    if is_jpeg_with_cuda(image_bytes, gpu_image_decode):
         try:
             encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
             image_tensor = decode_jpeg(encoded_image, device="cuda")
@@ -961,6 +968,7 @@ def _load_image(
 
 def load_image(
     image_file: Union[Image.Image, str, ImageData, bytes],
+    gpu_image_decode: bool = True,
 ) -> tuple[Union[torch.Tensor, Image.Image], Optional[tuple[int, int]]]:
     """
     Load image from multiple input formats, including:
@@ -975,21 +983,24 @@ def load_image(
         image = image_file
         image_size = (image.width, image.height)
     elif isinstance(image_file, bytes):
-        image = _load_image(image_bytes=image_file)
+        image = _load_image(image_bytes=image_file, gpu_image_decode=gpu_image_decode)
     elif isinstance(image_file, str) and image_file.startswith(("http://", "https://")):
-        image = _load_image(image_file=image_file)
+        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
     elif isinstance(image_file, str) and image_file.startswith("file://"):
-        image = _load_image(image_file=unquote(urlparse(image_file).path))
+        image = _load_image(
+            image_file=unquote(urlparse(image_file).path),
+            gpu_image_decode=gpu_image_decode,
+        )
     elif isinstance(image_file, str) and image_file.lower().endswith(
         image_extension_names
     ):
-        image = _load_image(image_file=image_file)
+        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
     elif isinstance(image_file, str) and image_file.startswith("data:"):
-        image = _load_image(image_file=image_file)
+        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
     elif isinstance(
         image_file, str
     ):  # Other formats, try to decode as base64 by default
-        image = _load_image(image_file=image_file)
+        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
     else:
         raise ValueError(f"Invalid image: {image_file}")
     return image, image_size
