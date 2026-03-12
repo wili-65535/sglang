@@ -256,11 +256,11 @@ class MMEncoder:
             return data
         try:
             if modality == Modality.IMAGE:
-                img, _ = load_image(data)
+                img, _ = load_image(data, False)
                 if (
                     discard_alpha_channel
-                    and img.mode != "RGB"
                     and not isinstance(img, torch.Tensor)
+                    and img.mode != "RGB"
                 ):
                     # Needed only when `img` is a PIL image
                     img = img.convert("RGB")
