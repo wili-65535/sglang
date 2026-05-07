@@ -18,6 +18,7 @@ import logging
 from functools import lru_cache
 from typing import Iterable, Optional, Set, Tuple, Union
 
+import nvtx
 import torch
 import torch.nn as nn
 import triton
@@ -605,27 +606,30 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
     ):
         forward_batch = kwargs.get("forward_batch", None)
 
-        hidden_states, residual = (
-            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
-                hidden_states,
-                residual,
-                forward_batch,
-                captured_last_layer_outputs=kwargs.get(
-                    "captured_last_layer_outputs", None
-                ),
+        with nvtx.annotate("prepare_attn", color="blue"):
+            hidden_states, residual = (
+                self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                    hidden_states,
+                    residual,
+                    forward_batch,
+                    captured_last_layer_outputs=kwargs.get(
+                        "captured_last_layer_outputs", None
+                    ),
+                )
             )
-        )
 
         if not forward_batch.forward_mode.is_idle():
-            hidden_states = self.linear_attn(
-                hidden_states,
-                forward_batch,
-            )
+            with nvtx.annotate("linear_attn", color="green"):
+                hidden_states = self.linear_attn(
+                    hidden_states,
+                    forward_batch,
+                )
 
         # Fully Connected
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
+        with nvtx.annotate("prepare_mlp", color="orange"):
+            hidden_states, residual = self.layer_communicator.prepare_mlp(
+                hidden_states, residual, forward_batch
+            )
 
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
@@ -636,23 +640,28 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 forward_batch
             )
         )
-        if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
-            hidden_states = self.mlp(
-                hidden_states,
-                forward_batch,
-                use_reduce_scatter,
-                should_allreduce_fusion,
-            )
-        else:
-            hidden_states = self.mlp(
-                hidden_states, should_allreduce_fusion, use_reduce_scatter
-            )
-        if should_allreduce_fusion:
-            hidden_states._sglang_needs_allreduce_fusion = True
-        else:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
-                hidden_states, residual, forward_batch
-            )
+        with nvtx.annotate(
+            f"mlp,{use_reduce_scatter=},{should_allreduce_fusion=}", color="yellow"
+        ):
+            if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
+                hidden_states = self.mlp(
+                    hidden_states,
+                    forward_batch,
+                    use_reduce_scatter,
+                    should_allreduce_fusion,
+                )
+            else:
+                hidden_states = self.mlp(
+                    hidden_states, should_allreduce_fusion, use_reduce_scatter
+                )
+
+        with nvtx.annotate("postprocess_layer", color="grey"):
+            if should_allreduce_fusion:
+                hidden_states._sglang_needs_allreduce_fusion = True
+            else:
+                hidden_states, residual = self.layer_communicator.postprocess_layer(
+                    hidden_states, residual, forward_batch
+                )
 
         return hidden_states, residual
 
@@ -876,26 +885,29 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         captured_last_layer_outputs: Optional[list[torch.Tensor]] = None,
         **kwargs,
     ):
-        hidden_states, residual = (
-            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
-                hidden_states,
-                residual,
-                forward_batch,
-                captured_last_layer_outputs=captured_last_layer_outputs,
+        with nvtx.annotate("prepare_attn", color="blue"):
+            hidden_states, residual = (
+                self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                    hidden_states,
+                    residual,
+                    forward_batch,
+                    captured_last_layer_outputs=captured_last_layer_outputs,
+                )
             )
-        )
 
         if not forward_batch.forward_mode.is_idle():
-            hidden_states = self.self_attention(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-            )
+            with nvtx.annotate("self_attention", color="green"):
+                hidden_states = self.self_attention(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                )
 
         # Fully Connected
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
+        with nvtx.annotate("prepare_mlp", color="orange"):
+            hidden_states, residual = self.layer_communicator.prepare_mlp(
+                hidden_states, residual, forward_batch
+            )
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
@@ -905,23 +917,27 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 forward_batch
             )
         )
-        if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
-            hidden_states = self.mlp(
-                hidden_states,
-                forward_batch,
-                use_reduce_scatter,
-                should_allreduce_fusion,
-            )
-        else:
-            hidden_states = self.mlp(
-                hidden_states, should_allreduce_fusion, use_reduce_scatter
-            )
-        if should_allreduce_fusion:
-            hidden_states._sglang_needs_allreduce_fusion = True
-        else:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
-                hidden_states, residual, forward_batch
-            )
+        with nvtx.annotate(
+            f"mlp,{use_reduce_scatter=},{should_allreduce_fusion=}", color="yellow"
+        ):
+            if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
+                hidden_states = self.mlp(
+                    hidden_states,
+                    forward_batch,
+                    use_reduce_scatter,
+                    should_allreduce_fusion,
+                )
+            else:
+                hidden_states = self.mlp(
+                    hidden_states, should_allreduce_fusion, use_reduce_scatter
+                )
+        with nvtx.annotate("postprocess_layer", color="grey"):
+            if should_allreduce_fusion:
+                hidden_states._sglang_needs_allreduce_fusion = True
+            else:
+                hidden_states, residual = self.layer_communicator.postprocess_layer(
+                    hidden_states, residual, forward_batch
+                )
 
         return hidden_states, residual
 
@@ -1104,17 +1120,18 @@ class Qwen3_5ForCausalLM(nn.Module):
             with get_global_expert_distribution_recorder().with_current_layer(
                 layer_idx
             ):
-                hidden_states, residual = layer(
-                    positions=positions,
-                    hidden_states=hidden_states,
-                    residual=residual,
-                    forward_batch=forward_batch,
-                    captured_last_layer_outputs=(
-                        aux_hidden_states
-                        if getattr(layer, "_is_layer_to_capture", False)
-                        else None
-                    ),
-                )
+                with nvtx.annotate(f"layers {layer_idx}", color="red"):
+                    hidden_states, residual = layer(
+                        positions=positions,
+                        hidden_states=hidden_states,
+                        residual=residual,
+                        forward_batch=forward_batch,
+                        captured_last_layer_outputs=(
+                            aux_hidden_states
+                            if getattr(layer, "_is_layer_to_capture", False)
+                            else None
+                        ),
+                    )
 
             # Process deepstack embeddings if provided
             if (
