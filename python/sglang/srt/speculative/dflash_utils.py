@@ -555,6 +555,45 @@ class DFlashDraftConfig:
     emb_dim: Optional[int]
     attention_sink_bias: bool = False
     attention_value_scale: Optional[float] = None
+    target_feature_type: Optional[str] = None
+    target_hc_count: Optional[int] = None
+    target_hidden_size: Optional[int] = None
+
+    def resolve_context_feature_width(self, *, hidden_size: int) -> int:
+        """Width of one tapped target feature, which fc consumes num_taps of.
+
+        A plain draft taps one hidden state per layer. A post_layer_hc draft taps
+        the target's hyper-connection residual streams, all hc_count of them, so
+        its feature is that many times wider.
+        """
+        hidden_size = int(hidden_size)
+        if self.target_feature_type in (None, "hidden"):
+            return hidden_size
+        if self.target_feature_type != "post_layer_hc":
+            raise ValueError(
+                "DFLASH target_feature_type must be 'hidden' or 'post_layer_hc', "
+                f"got {self.target_feature_type!r}."
+            )
+        if self.target_hc_count is None and self.target_hidden_size is None:
+            raise ValueError(
+                "DFLASH target_feature_type='post_layer_hc' requires "
+                "target_hc_count or target_hidden_size in the draft config."
+            )
+        width = (
+            hidden_size * int(self.target_hc_count)
+            if self.target_hidden_size is None
+            else int(self.target_hidden_size)
+        )
+        if self.target_hc_count is not None and width != hidden_size * int(
+            self.target_hc_count
+        ):
+            raise ValueError(
+                "DFLASH post_layer_hc config is inconsistent: "
+                f"target_hidden_size={self.target_hidden_size} but "
+                f"target_hc_count={self.target_hc_count} * hidden_size={hidden_size} "
+                f"= {hidden_size * int(self.target_hc_count)}."
+            )
+        return width
 
     @property
     def is_domino(self) -> bool:
@@ -742,6 +781,23 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
             )
         attention_value_scale = float(raw_attention_value_scale)
 
+    # Carried at the top level of the checkpoint config, not under dflash_config.
+    target_feature_type = dflash_cfg.get(
+        "target_feature_type", _cfg_get(draft_hf_config, "target_feature_type", None)
+    )
+    target_hc_count = _parse_optional_int(
+        dflash_cfg.get("target_hc_count", _cfg_get(draft_hf_config, "target_hc_count", None)),
+        field_name="DFLASH target_hc_count",
+        min_value=1,
+    )
+    target_hidden_size = _parse_optional_int(
+        dflash_cfg.get(
+            "target_hidden_size", _cfg_get(draft_hf_config, "target_hidden_size", None)
+        ),
+        field_name="DFLASH target_hidden_size",
+        min_value=1,
+    )
+
     projector_type = dflash_cfg.get(
         "projector_type", _cfg_get(draft_hf_config, "projector_type", None)
     )
@@ -828,6 +884,9 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         emb_dim=emb_dim,
         attention_sink_bias=attention_sink_bias,
         attention_value_scale=attention_value_scale,
+        target_feature_type=target_feature_type,
+        target_hc_count=target_hc_count,
+        target_hidden_size=target_hidden_size,
     )
 
 
