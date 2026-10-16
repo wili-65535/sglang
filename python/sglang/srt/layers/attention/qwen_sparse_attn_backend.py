@@ -191,6 +191,12 @@ class QwenSparseAttnBackend(AttentionBackend):
             if self.qsa_profile is not None
             else int(getattr(config, "indexer_compress_ratio", 4))
         )
+        # The pool allocated the ring, so it owns the stride.
+        self.ring_stride = (
+            self.compress_ratio
+            if self.token_to_kv_pool is None
+            else self.token_to_kv_pool.qsa_ring_stride
+        )
         req_pool = getattr(runner, "req_to_token_pool", None)
         self.req_to_token = getattr(req_pool, "req_to_token", None)
         self.req_to_token_pool = req_pool
@@ -235,13 +241,13 @@ class QwenSparseAttnBackend(AttentionBackend):
                 "Qwen QSA target verification supports only speculative_eagle_topk=1"
             )
         draft_tokens = int(getattr(spec_info, "draft_token_num", 0) or 0)
-        if draft_tokens > self.compress_ratio:
-            # The pending-group ring keys state by position % ratio; a verify
-            # window wider than the ratio would collide within one forward.
+        if draft_tokens > self.ring_stride:
+            # The ring keys state by position % stride, so a forward writing
+            # more positions than the stride would collide within itself.
             raise NotImplementedError(
-                "Qwen QSA requires speculative_num_draft_tokens <= the QSA "
-                f"compress ratio ({self.compress_ratio}): the pending "
-                f"index-key ring holds one group; got {draft_tokens}"
+                "Qwen QSA sized its pending index-key ring for a verify window "
+                f"of {self.ring_stride} (compress ratio {self.compress_ratio}); "
+                f"got {draft_tokens}"
             )
 
     @staticmethod
@@ -439,6 +445,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             out_cache_loc=out_cache_loc,
             token_to_kv_pool=self.token_to_kv_pool,
             compress_ratio=self.token_to_kv_pool.qsa_compress_ratio,
+            ring_stride=self.ring_stride,
             block_topk=self.token_to_kv_pool.qsa_block_topk,
         )
         return QwenSparseAttnMetadata(
@@ -675,6 +682,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 sequence_lengths=sequence_lengths,
                 logical_positions=ring_logical_positions,
                 compress_ratio=self.compress_ratio,
+                ring_stride=self.ring_stride,
                 is_extend=group_member_rows is not None,
             )
             if write_locs.numel():
@@ -693,6 +701,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                         group_end_positions=group_positions.long(),
                         sequence_ids=group_sequence_ids.long(),
                         compress_ratio=self.compress_ratio,
+                        ring_stride=self.ring_stride,
                     )
         indexer_metadata = QSAIndexerMetadata(
             sequence_lengths=sequence_lengths,
@@ -701,6 +710,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             out_cache_loc=forward_batch.out_cache_loc,
             token_to_kv_pool=self.token_to_kv_pool,
             compress_ratio=self.token_to_kv_pool.qsa_compress_ratio,
+            ring_stride=self.ring_stride,
             block_topk=self.token_to_kv_pool.qsa_block_topk,
             req_pool_indices=row_req_pool_indices,
             write_locs=write_locs,
@@ -885,6 +895,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             out_cache_loc=self._graph_dummy_out_cache_loc[:metadata_rows],
             token_to_kv_pool=pool,
             compress_ratio=pool.qsa_compress_ratio,
+            ring_stride=self.ring_stride,
             block_topk=pool.qsa_block_topk,
             req_pool_indices=self._graph_row_req_pool_indices[:metadata_rows],
             is_cuda_graph=True,
@@ -1091,6 +1102,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 sequence_lengths=metadata.sequence_lengths,
                 logical_positions=current_positions,
                 compress_ratio=ratio,
+                ring_stride=self.ring_stride,
                 is_extend=False,
             )
         )
@@ -1100,6 +1112,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 group_end_positions=current_positions,
                 sequence_ids=metadata.token_to_batch_idx.long(),
                 compress_ratio=ratio,
+                ring_stride=self.ring_stride,
             ).to(torch.int32)
         )
 

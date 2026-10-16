@@ -1935,6 +1935,9 @@ class KVCacheConfigurator:
                 qsa_compress_ratio=qsa_profile.compress_ratio,
                 qsa_token_topk=qsa_profile.budget,
                 num_request_slots=req_to_token_pool.req_to_token.shape[0],
+                # A verify window writes this many positions in one forward,
+                # which is what the pending ring has to span.
+                max_write_positions=max_speculative_num_draft_tokens() or 1,
             )
         token_to_kv_pool = pool_class(
             page_size=self.pool_page_size,
