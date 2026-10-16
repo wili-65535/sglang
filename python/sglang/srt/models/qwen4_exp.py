@@ -1783,16 +1783,11 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
 
         hc_hidden_states = hidden_states
         hidden_states, _ = self.hyper_connection_mixer.mix(hidden_states)
+        # Always (hidden, hc streams, DFlash captures): an arity that varied by
+        # forward mode made callers guess, and the non-idle shape they guessed
+        # dropped the captures.
         captured = aux_hidden_states if len(aux_hidden_states) > 0 else None
-        # The hc streams and the DFlash captures both leave here; the non-idle
-        # arity is 3 so the caller can tell them apart. Returning two dropped
-        # the captures on every real forward.
-        if not forward_batch.forward_mode.is_idle():
-            return hidden_states, hc_hidden_states, captured
-
-        if captured is None:
-            return hidden_states
-        return hidden_states, captured
+        return hidden_states, hc_hidden_states, captured
 
 
 class Qwen4ExpVLModel(Qwen4ExpModel):
@@ -1832,13 +1827,10 @@ class Qwen4ExpVLModel(Qwen4ExpModel):
         if isinstance(model_output, PPProxyTensors):
             return model_output
         if isinstance(model_output, tuple):
-            if len(model_output) == 3:
-                hidden_states, self.last_hc_hidden_states, captured = model_output
-                if captured is None:
-                    return hidden_states
-                return hidden_states, captured
-            hidden_states, self.last_hc_hidden_states = model_output
-            return hidden_states
+            hidden_states, self.last_hc_hidden_states, captured = model_output
+            if captured is None:
+                return hidden_states
+            return hidden_states, captured
         return model_output
 
 
