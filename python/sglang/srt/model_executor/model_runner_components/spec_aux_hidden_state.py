@@ -194,11 +194,6 @@ def _resolve_dflash_aux_hidden_state(
             dspark_draft_config = parse_dspark_draft_config(
                 draft_hf_config=draft_model_config.hf_config
             )
-            if not dspark_draft_config.require_markov():
-                raise ValueError(
-                    "DSPARK requires markov_rank > 0 in the draft config, "
-                    f"got markov_rank={dspark_draft_config.markov_rank}."
-                )
             if dspark_draft_config.target_layer_ids is not None:
                 target_layer_ids = list(dspark_draft_config.target_layer_ids)
 

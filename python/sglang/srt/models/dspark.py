@@ -370,13 +370,67 @@ class RNNHead(VanillaMarkov):
         return None
 
 
+class NoMarkov(nn.Module):
+    """Identity step bias for a draft trained without a Markov head (DFlash-shaped
+    weights served on the DSpark path). Every block step keeps its own base
+    logits, so the block proposal is step-independent."""
+
+    markov_head_type = "none"
+
+    def apply_step_logits(
+        self,
+        logits: torch.Tensor,
+        *,
+        token_ids: torch.Tensor,
+        hidden_states: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        del token_ids, hidden_states
+        return logits
+
+    def apply_block_logits(
+        self,
+        base_logits: torch.Tensor,
+        *,
+        token_ids: torch.Tensor,
+        hidden_states: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        del token_ids, hidden_states
+        return base_logits
+
+    def sample_block(
+        self,
+        base_logits: torch.Tensor,
+        *,
+        first_prev_tokens: torch.Tensor,
+        hidden_states: Optional[torch.Tensor],
+        sampler: StepSampler,
+        collect_corrected: bool = True,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        return run_markov_block(
+            self,
+            base_logits,
+            first_prev_tokens=first_prev_tokens,
+            hidden_states=hidden_states,
+            sampler=sampler,
+            collect_corrected=collect_corrected,
+        )
+
+    def sample_block_greedy_fused(
+        self,
+        base_logits: torch.Tensor,
+        *,
+        first_prev_tokens: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        # The fused kernel exists to fold the bias GEMV into argmax; with no
+        # bias there is nothing to fuse.
+        del base_logits, first_prev_tokens
+        return None
+
+
 def build_markov_head(config) -> Optional[nn.Module]:
     markov_rank = int(getattr(config, "markov_rank", 0))
     if markov_rank <= 0:
-        raise ValueError(
-            "DSpark requires markov_rank > 0 (the Markov head is the core of the "
-            f"semi-AR draft); got markov_rank={markov_rank}."
-        )
+        return NoMarkov()
     markov_head_type = str(getattr(config, "markov_head_type", "vanilla")).lower()
     vocab_size = int(config.vocab_size)
     hidden_size = int(config.hidden_size)
@@ -486,11 +540,6 @@ class DSparkDraftMixin:
         self._fused_kv_write_cache = None
         self.logits_mup_width_multiplier = None
         dspark_config = parse_dspark_draft_config(draft_hf_config=config)
-        if not dspark_config.require_markov():
-            raise ValueError(
-                "DSpark draft requires markov_rank > 0, "
-                f"got markov_rank={dspark_config.markov_rank}."
-            )
         self.gamma = int(dspark_config.resolve_gamma(default=self.block_size))
         self.sample_from_anchor = get_dspark_sample_from_anchor(config)
         if self.is_nemotron_35_draft:

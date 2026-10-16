@@ -91,11 +91,6 @@ def resolve_runtime_config(
     verify window, mask token) from the draft checkpoint config, with
     server_args.speculative_num_draft_tokens taking precedence for gamma."""
     draft_config = parse_dspark_draft_config(draft_hf_config=draft_hf_config)
-    if not draft_config.require_markov():
-        raise ValueError(
-            "DSpark draft requires markov_rank > 0; got "
-            f"markov_rank={draft_config.markov_rank}."
-        )
 
     if speculative_num_draft_tokens is None:
         gamma = int(draft_config.resolve_gamma(default=None) or 0)

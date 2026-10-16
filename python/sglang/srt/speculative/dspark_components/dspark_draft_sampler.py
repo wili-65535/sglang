@@ -27,7 +27,12 @@ def _base_logits_dtype(model) -> torch.dtype:
     weight = model.lm_head.weight
     if weight.is_floating_point():
         return weight.dtype
-    return next(model.markov_head.parameters()).dtype
+    markov_params = list(model.markov_head.parameters())
+    if markov_params:
+        return markov_params[0].dtype
+    # A markov-free draft head holds no parameters; the fc output norm carries
+    # the same activation dtype.
+    return model.hidden_norm.weight.dtype
 
 
 def greedy_step_sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
