@@ -528,6 +528,9 @@ class Envs:
     # DSpark speculative decoding
     # ===================================================================
     SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER = EnvBool(False)
+    # Check that every committed token equals the target's greedy output at
+    # that position; unlike an output diff it survives a budget-trimmed layout.
+    SGLANG_DSPARK_DEBUG_COMMIT_PREFIX = EnvBool(False)
     SGLANG_DSPARK_DEBUG_CONFIDENCE_METRICS = EnvBool(False)
     SGLANG_DSPARK_DEBUG_DUMP = EnvTuple(tuple())
     SGLANG_DSPARK_LOG_SPS_PRED_INTERVAL = EnvInt(0)

@@ -63,6 +63,9 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     dp_global_verify_tier_num_tokens,
     idle_ragged_layout,
 )
+from sglang.srt.speculative.dspark_components.dspark_commit_check import (
+    check_commit_prefix,
+)
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     CommitInjectCtx,
     DsparkVerifyEpilogue,
@@ -355,6 +358,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
 
         self._simulate_acc_len = float(envs.SGLANG_SIMULATE_ACC_LEN.get())
+        self._debug_commit_prefix = envs.SGLANG_DSPARK_DEBUG_COMMIT_PREFIX.get()
         if (
             self._simulate_acc_len > 0
             and self._simulate_acc_len != 1.0
@@ -902,6 +906,17 @@ class DSparkWorkerV2(BaseSpecWorker):
             prefix_lens=prefix_lens,
             draft_tokens=draft_tokens,
         )
+        if self._debug_commit_prefix and (
+            sampling_info is None or sampling_info.is_all_greedy
+        ):
+            check_commit_prefix(
+                out_tokens=accept.out_tokens,
+                commit_lens=accept.commit_lens,
+                target_logits=logits_output.next_token_logits,
+                verify_lens=None if layout is None else layout.verify_lens,
+                stride=self.verify_num_draft_tokens,
+                forward_ct=int(batch.forward_iter),
+            )
         self.model_runner.ngram_embedding_manager.update_after_verify(
             verify_ids_2d=verify_ids_2d,
             req_pool_indices=batch.req_pool_indices,
