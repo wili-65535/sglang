@@ -1828,7 +1828,11 @@ class Qwen4ExpVLModel(Qwen4ExpModel):
             return model_output
         if isinstance(model_output, tuple):
             hidden_states, self.last_hc_hidden_states, captured = model_output
-            if captured is None:
+            # The caller unpacks on capture_aux_hidden_states, fixed at setup,
+            # so the arity cannot depend on what this one forward captured: the
+            # autotune warmup runs no layers and captures nothing, and a bare
+            # tensor returned there is unpacked by row.
+            if not self.layers_to_capture:
                 return hidden_states
             return hidden_states, captured
         return model_output
