@@ -76,6 +76,7 @@ from sglang.srt.models.qwen4_exp_ple_table import (
     make_ple_file_rss_trimmer,
 )
 from sglang.srt.runtime_context import get_forward, get_parallel
+from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.utils import get_bool_env_var, is_hip, logger
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
@@ -135,9 +136,21 @@ class _PLEBatch(msgspec.Struct, frozen=True):
     req_indices: torch.Tensor
     token_offsets: torch.Tensor
     valid_tokens: torch.Tensor
+    # [bs, row_width]; the dense-layout twin of valid_tokens. Ragged verify packs
+    # rows end to end, so the flat mask has no [bs, row_width] view to reshape to.
+    valid_steps: Optional[torch.Tensor]
     state_indices: torch.Tensor
     ngram_context: Optional[torch.Tensor]
     ngram_eos_token_id: Optional[int]
+
+
+def _rows_any(
+    flat: torch.Tensor, req_indices: torch.Tensor, sequence_count: int
+) -> torch.Tensor:
+    """Per-row OR of a flat per-token mask, without a [bs, row_width] view."""
+    hits = torch.zeros(sequence_count, dtype=torch.int32, device=flat.device)
+    hits.index_add_(0, req_indices, flat.to(torch.int32))
+    return hits.ne(0)
 
 
 def _prepare_ple_batch(
@@ -178,32 +191,57 @@ def _prepare_ple_batch(
     if mode.is_target_verify():
         assert forward_batch.spec_info is not None
         row_width = int(forward_batch.spec_info.draft_token_num)
-        if row_width <= 0 or processed_tokens % row_width != 0:
-            raise RuntimeError(
-                "target verify rows must contain complete draft strides: "
-                f"{processed_tokens=} {row_width=}"
+        ragged_layout = resolve_ragged_verify_layout(forward_batch)
+        if ragged_layout is not None:
+            # Compact ragged verify gives each row its own budget and packs the
+            # rows end to end, so a token's row is a search in qo_indptr rather
+            # than a division by the stride. The dense [bs, row_width] working
+            # layout still holds: no row exceeds the stride.
+            lengths = ragged_layout.verify_lens.long()
+            sequence_count = lengths.shape[0]
+            total_verify_tokens = ragged_layout.total_verify_tokens
+            if (
+                total_verify_tokens is not None
+                and processed_tokens > total_verify_tokens
+            ):
+                # Past the layout's coverage an offset would run off its row and
+                # land in the next request's dense slot; refuse instead.
+                raise RuntimeError(
+                    "ragged verify layout does not cover the batch: "
+                    f"{processed_tokens=} {total_verify_tokens=}"
+                )
+            query_start_loc = ragged_layout.qo_indptr_device.long()
+            req_indices = torch.searchsorted(
+                query_start_loc[1:], positions, right=True
+            ).clamp(max=sequence_count - 1)
+            token_offsets = positions - query_start_loc.index_select(0, req_indices)
+        else:
+            if row_width <= 0 or processed_tokens % row_width != 0:
+                raise RuntimeError(
+                    "target verify rows must contain complete draft strides: "
+                    f"{processed_tokens=} {row_width=}"
+                )
+            sequence_count = processed_tokens // row_width
+            # Eager verify rows can be shorter than the row stride;
+            # ignore the synthetic one-token lengths from DP attention's verify-as-EXTEND.
+            lengths = (
+                forward_batch.extend_seq_lens[:sequence_count].long()
+                if forward_batch.forward_mode.is_target_verify()
+                and forward_batch.extend_seq_lens is not None
+                else torch.full(
+                    (sequence_count,),
+                    row_width,
+                    dtype=torch.long,
+                    device=tokens.device,
+                )
             )
-        sequence_count = processed_tokens // row_width
-        # Eager verify rows can be shorter than the row stride;
-        # ignore the synthetic one-token lengths from DP attention's verify-as-EXTEND.
-        lengths = (
-            forward_batch.extend_seq_lens[:sequence_count].long()
-            if forward_batch.forward_mode.is_target_verify()
-            and forward_batch.extend_seq_lens is not None
-            else torch.full(
-                (sequence_count,),
-                row_width,
-                dtype=torch.long,
-                device=tokens.device,
-            )
-        )
-        if lengths.shape[0] != sequence_count:
-            raise RuntimeError(
-                "target verify length metadata does not match its fixed rows: "
-                f"{lengths.shape[0]=} {sequence_count=}"
-            )
-        req_indices = torch.div(positions, row_width, rounding_mode="floor")
-        token_offsets = positions - req_indices * row_width
+            if lengths.shape[0] != sequence_count:
+                raise RuntimeError(
+                    "target verify length metadata does not match its fixed rows: "
+                    f"{lengths.shape[0]=} {sequence_count=}"
+                )
+            req_indices = torch.div(positions, row_width, rounding_mode="floor")
+            token_offsets = positions - req_indices * row_width
     elif mode.is_decode():
         lengths = torch.ones(processed_tokens, dtype=torch.long, device=tokens.device)
         row_width = 1
@@ -234,8 +272,15 @@ def _prepare_ple_batch(
         valid_tokens = torch.ones(
             processed_tokens, dtype=torch.bool, device=tokens.device
         )
+        valid_steps = None
     else:
         valid_tokens = token_offsets < lengths.index_select(0, req_indices)
+        valid_steps = (
+            torch.arange(row_width, device=tokens.device, dtype=torch.long).unsqueeze(0)
+            < lengths.unsqueeze(1)
+            if mode.is_target_verify()
+            else None
+        )
 
     state_indices = (
         get_req_to_token_pool()
@@ -258,9 +303,9 @@ def _prepare_ple_batch(
         if out_cache_loc is not None and mode.is_decode():
             valid = valid & out_cache_loc[:sequence_count].ne(0)
         elif out_cache_loc is not None and mode.is_target_verify():
-            valid = valid & out_cache_loc[:processed_tokens].reshape(
-                sequence_count, row_width
-            ).ne(0).any(dim=1)
+            valid = valid & _rows_any(
+                out_cache_loc[:processed_tokens].ne(0), req_indices, sequence_count
+            )
         state_indices = torch.where(
             valid, state_indices, torch.zeros_like(state_indices)
         )
@@ -298,6 +343,7 @@ def _prepare_ple_batch(
         req_indices=req_indices,
         token_offsets=token_offsets,
         valid_tokens=valid_tokens,
+        valid_steps=valid_steps,
         state_indices=state_indices,
         ngram_context=ngram_context,
         ngram_eos_token_id=ngram_eos_token_id,
@@ -315,12 +361,10 @@ def _commit_ple_batch(batch: Optional[_PLEBatch], forward_batch: ForwardBatch) -
     context_len = context.shape[1] - batch.row_width
     if batch.mode.is_target_verify():
         step_contexts = context.unfold(1, context_len, 1)[:, 1:]
-        valid_steps = batch.valid_tokens.reshape(
-            batch.lengths.shape[0], batch.row_width
-        )
+        assert batch.valid_steps is not None
         pool.set_ngram_intermediate_context(
             torch.where(
-                valid_steps.unsqueeze(-1),
+                batch.valid_steps.unsqueeze(-1),
                 step_contexts,
                 torch.full_like(step_contexts, batch.ngram_eos_token_id),
             )
@@ -1092,11 +1136,9 @@ class Qwen4ExpPLELayer(nn.Module):
                             0,
                         )
                     )
-                valid_steps = batch.valid_tokens.reshape(
-                    batch.lengths.shape[0], batch.row_width, 1, 1
-                )
+                assert batch.valid_steps is not None
                 intermediate_state = torch.where(
-                    valid_steps,
+                    batch.valid_steps[:, :, None, None],
                     intermediate_state,
                     torch.zeros_like(intermediate_state),
                 )
