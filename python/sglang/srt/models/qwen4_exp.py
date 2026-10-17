@@ -1887,8 +1887,17 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             get_embedding=get_embedding,
             pp_proxy_tensors=pp_proxy_tensors,
         )
+        # Two drafts read output.hidden_states and want different things: the
+        # MTP head wants the hc streams, while an external DFlash draft wants
+        # the tapped layer features the logits processor already packed there
+        # (num taps * hc width). Overwriting unconditionally handed the DFlash
+        # draft one tap's width and tripped its fc shape check.
         hc_hidden_states = self.model.last_hc_hidden_states
-        if hc_hidden_states is not None and isinstance(output, LogitsProcessorOutput):
+        if (
+            not self.capture_aux_hidden_states
+            and hc_hidden_states is not None
+            and isinstance(output, LogitsProcessorOutput)
+        ):
             output.hidden_states = hc_hidden_states
         return output
 
