@@ -21,7 +21,10 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
+from sglang.srt.layers.aux_hidden_states import (
+    AuxHiddenStateAccumulator,
+    AuxHiddenStateList,
+)
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather,
     attn_tp_all_reduce,
@@ -1368,6 +1371,7 @@ class Qwen4ExpLayerExtensionMixin:
         forward_batch: ForwardBatch,
         *,
         ple_batch: Optional[_PLEBatch],
+        captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
     ):
         hc_dim = self.hc_count * self.hidden_size
         if hidden_states.shape[-1] != hc_dim:
@@ -1375,6 +1379,12 @@ class Qwen4ExpLayerExtensionMixin:
             hidden_states = torch.cat(
                 [hidden_states for _ in range(self.hc_count)], dim=-1
             )
+
+        # Layers hand each other the full hc stream (residual is None between
+        # them), so this layer's input is the previous layer's output -- the
+        # hc_count * hidden_size feature a post_layer_hc DFlash draft taps.
+        if captured_last_layer_outputs is not None:
+            captured_last_layer_outputs.capture(hidden_states)
 
         if self.ple is not None:
             if ple_batch is None:
@@ -1503,6 +1513,7 @@ class Qwen4ExpLinearDecoderLayer(
             residual,
             forward_batch,
             ple_batch=kwargs.get("ple_batch"),
+            captured_last_layer_outputs=kwargs.get("captured_last_layer_outputs"),
         )
 
         if not forward_batch.forward_mode.is_idle():
@@ -1646,6 +1657,7 @@ class Qwen4ExpAttentionDecoderLayer(
             residual,
             forward_batch,
             ple_batch=kwargs.get("ple_batch"),
+            captured_last_layer_outputs=kwargs.get("captured_last_layer_outputs"),
         )
 
         if not forward_batch.forward_mode.is_idle():
