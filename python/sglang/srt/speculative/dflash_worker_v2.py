@@ -118,6 +118,31 @@ def _get_fused_kv_materialize_helper():
     return _FusedKVMaterializeHelper
 
 
+def _shifted_exp_partition(
+    logits: torch.Tensor, maxima: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    """sum(exp(logit - max)) per row, fp32. The reciprocal is the max softmax
+    probability, which for a greedy draft is the chosen token's probability.
+
+    The subtraction allocates one more tensor the size of the logits; summing in
+    fp32 off a bf16 exp measures 4.5e-4 relative, against 2.6e-3 for a bf16
+    accumulation.
+    """
+    if maxima is None:
+        maxima = logits.amax(dim=-1)
+    return (logits - maxima.unsqueeze(-1)).exp_().sum(dim=-1, dtype=torch.float32)
+
+
+def _merge_shard_partitions(
+    *, partitions: torch.Tensor, maxima: torch.Tensor
+) -> torch.Tensor:
+    """Per-shard (sum exp(logit - shard max), shard max) [tp, n] -> the global max
+    softmax probability [n]. Each shard is re-centered on the global max before
+    the ranks are summed."""
+    global_max = maxima.amax(dim=0)
+    return (partitions * (maxima - global_max).exp()).sum(dim=0).reciprocal_()
+
+
 class _DflashDraftSampler:
     """Capture-safe greedy argmax over the target LM head, run inside the draft
     cuda graph so the draft sampling is captured and counted in fwd_occupancy.
@@ -128,6 +153,11 @@ class _DflashDraftSampler:
     Tie resolution is bit-exact vs a full-vocab argmax: ranks own contiguous
     ascending vocab shards and torch.argmax returns the FIRST max index.
     No added-vocab support (the builder bails to eager in that case).
+
+    Also publishes the chosen token's vocab-wide softmax probability into
+    `confidence` [max_bs, gamma], the per-token confidence the adaptive verify
+    budget consumes. Greedy picks the argmax, so that probability is 1/sum
+    exp(logit - max) and needs no gather of the chosen logit.
     """
 
     def __init__(
@@ -139,9 +169,13 @@ class _DflashDraftSampler:
         self.org_vocab_start = int(org_vocab_start)
         self.tp_group = tp_group
         self.tp_size = int(tp_group.world_size) if tp_group is not None else 1
-        max_tokens = int(max_bs) * (self.block_size - 1)
+        self.gamma = self.block_size - 1
+        max_tokens = int(max_bs) * self.gamma
         device = weight.device
         self.out = torch.empty((max_tokens,), dtype=torch.int64, device=device)
+        self.confidence = torch.empty(
+            (int(max_bs), self.gamma), dtype=torch.float32, device=device
+        )
         if self.tp_size > 1:
             # Static buffers (fixed addresses) keep the in-graph select replay-safe.
             self.local_max = torch.empty(
@@ -162,6 +196,21 @@ class _DflashDraftSampler:
             self.selected_ids = torch.empty(
                 (1, max_tokens), dtype=torch.int64, device=device
             )
+            # fp32: accumulating the partition in bf16 instead costs 2.6e-3
+            # relative on the probability against 4.5e-4 here, and the budget
+            # compounds it through a prefix product.
+            self.local_partition = torch.empty(
+                (max_tokens,), dtype=torch.float32, device=device
+            )
+            self.local_max_f32 = torch.empty(
+                (max_tokens,), dtype=torch.float32, device=device
+            )
+            self.gathered_partition = torch.empty(
+                (self.tp_size * max_tokens,), dtype=torch.float32, device=device
+            )
+            self.gathered_max_f32 = torch.empty(
+                (self.tp_size * max_tokens,), dtype=torch.float32, device=device
+            )
 
     def __call__(self, hidden_states, input_ids=None):
         # draft tokens are block positions 1: (pos 0 is the seeded bonus token)
@@ -175,6 +224,8 @@ class _DflashDraftSampler:
         logits = torch.matmul(hs, self.weight[: self.num_org].T)
         if self.tp_size == 1:
             tokens = torch.argmax(logits, dim=-1).to(torch.long)
+            partition = _shifted_exp_partition(logits)
+            self._write_confidence(bs=bs, confidence=partition.reciprocal_())
             if self.org_vocab_start:
                 tokens += self.org_vocab_start
             self.out[:n].copy_(tokens)
@@ -182,17 +233,35 @@ class _DflashDraftSampler:
         local_max = self.local_max[:n]
         local_arg = self.local_arg[:n]
         torch.max(logits, dim=-1, out=(local_max, local_arg))
+        local_partition = self.local_partition[:n]
+        local_partition.copy_(_shifted_exp_partition(logits, maxima=local_max))
+        local_max_f32 = self.local_max_f32[:n]
+        local_max_f32.copy_(local_max)
         if self.org_vocab_start:
             local_arg.add_(self.org_vocab_start)
         gathered_max = self.gathered_max[: self.tp_size * n]
         gathered_ids = self.gathered_ids[: self.tp_size * n]
         self.tp_group.all_gather_into_tensor(gathered_max, local_max)
         self.tp_group.all_gather_into_tensor(gathered_ids, local_arg)
+        gathered_partition = self.gathered_partition[: self.tp_size * n]
+        gathered_max_f32 = self.gathered_max_f32[: self.tp_size * n]
+        self.tp_group.all_gather_into_tensor(gathered_partition, local_partition)
+        self.tp_group.all_gather_into_tensor(gathered_max_f32, local_max_f32)
         best_rank = self.best_rank[:, :n]
         torch.argmax(gathered_max.view(self.tp_size, n), dim=0, out=best_rank[0])
         selected = self.selected_ids[:, :n]
         torch.gather(gathered_ids.view(self.tp_size, n), 0, best_rank, out=selected)
         self.out[:n].copy_(selected.view(-1))
+        self._write_confidence(
+            bs=bs,
+            confidence=_merge_shard_partitions(
+                partitions=gathered_partition.view(self.tp_size, n),
+                maxima=gathered_max_f32.view(self.tp_size, n),
+            ),
+        )
+
+    def _write_confidence(self, *, bs: int, confidence: torch.Tensor) -> None:
+        self.confidence[:bs].copy_(confidence.view(bs, self.gamma))
 
 
 def _commit_accept(candidates, accept_len, bonus_tokens):
