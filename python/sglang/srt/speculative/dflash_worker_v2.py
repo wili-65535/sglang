@@ -82,6 +82,9 @@ from sglang.srt.speculative.dspark_components.dspark_commit_check import (
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import resolve_greedy_mask
 from sglang.srt.speculative.dspark_components.dspark_planner import DSparkVerifyPlanner
+from sglang.srt.speculative.dspark_components.dspark_sts import (
+    load_sts_calibration_from_path,
+)
 from sglang.srt.speculative.lilicorr_utils import (
     build_lilicorr_draft_sampler,
     propose_lilicorr_block,
@@ -131,10 +134,13 @@ def _get_fused_kv_materialize_helper():
 
 
 def _shifted_exp_partition(
-    logits: torch.Tensor, maxima: Optional[torch.Tensor] = None
+    logits: torch.Tensor,
+    maxima: Optional[torch.Tensor] = None,
+    temperatures: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """sum(exp(logit - max)) per row, fp32. The reciprocal is the max softmax
-    probability, which for a greedy draft is the chosen token's probability.
+    """sum(exp((logit - max) / T)) per row, fp32. The reciprocal is the max
+    softmax probability, which for a greedy draft is the chosen token's
+    probability. `temperatures` is [n] and defaults to 1.
 
     The subtraction allocates one more tensor the size of the logits; summing in
     fp32 off a bf16 exp measures 4.5e-4 relative, against 2.6e-3 for a bf16
@@ -142,21 +148,47 @@ def _shifted_exp_partition(
     """
     if maxima is None:
         maxima = logits.amax(dim=-1)
-    return (logits - maxima.unsqueeze(-1)).exp_().sum(dim=-1, dtype=torch.float32)
+    shifted = logits - maxima.unsqueeze(-1)
+    if temperatures is not None:
+        shifted = shifted.div_(temperatures.unsqueeze(-1))
+    return shifted.exp_().sum(dim=-1, dtype=torch.float32)
 
 
 def _merge_shard_partitions(
-    *, partitions: torch.Tensor, maxima: torch.Tensor
+    *,
+    partitions: torch.Tensor,
+    maxima: torch.Tensor,
+    temperatures: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Per-shard (sum exp(logit - shard max), shard max) [tp, n] -> the global max
-    softmax probability [n]. Each shard is re-centered on the global max before
-    the ranks are summed."""
+    """Per-shard (sum exp((logit - shard max) / T), shard max) [tp, n] -> the
+    global max softmax probability [n]. Each shard is re-centered on the global
+    max before the ranks are summed, and the re-centering carries the same
+    temperature the partitions were built with."""
     global_max = maxima.amax(dim=0)
-    return (partitions * (maxima - global_max).exp()).sum(dim=0).reciprocal_()
+    recentered = maxima - global_max
+    if temperatures is not None:
+        recentered = recentered.div(temperatures)
+    return (partitions * recentered.exp()).sum(dim=0).reciprocal_()
+
+
+def tile_sts_temperatures(
+    temperatures: Optional[torch.Tensor], bs: int
+) -> Optional[torch.Tensor]:
+    """[gamma] per-position temperatures -> [bs * gamma], matching the row order
+    of the draft logits (request-major, position-minor)."""
+    if temperatures is None:
+        return None
+    return temperatures.unsqueeze(0).expand(bs, -1).reshape(-1)
 
 
 def draft_confidence_from_head(
-    *, hidden_states: torch.Tensor, lm_head, bs: int, gamma: int, tp_group=None
+    *,
+    hidden_states: torch.Tensor,
+    lm_head,
+    bs: int,
+    gamma: int,
+    tp_group=None,
+    sts_temperatures: Optional[torch.Tensor] = None,
 ) -> Optional[torch.Tensor]:
     """[bs, gamma] confidence for drafted tokens, off a second pass over the
     target head. None when the head's shape rules the derivation out.
@@ -189,7 +221,8 @@ def draft_confidence_from_head(
     if hs.dtype != weight.dtype:
         hs = hs.to(weight.dtype)
     logits = torch.matmul(hs, weight[:num_org].T)
-    partition = _shifted_exp_partition(logits)
+    temperatures = tile_sts_temperatures(sts_temperatures, bs)
+    partition = _shifted_exp_partition(logits, temperatures=temperatures)
     tp_size = 1 if tp_group is None else int(tp_group.world_size)
     if tp_size == 1:
         return partition.reciprocal_().view(bs, gamma)
@@ -203,6 +236,7 @@ def draft_confidence_from_head(
     return _merge_shard_partitions(
         partitions=gathered_partition.view(tp_size, n),
         maxima=gathered_max.view(tp_size, n),
+        temperatures=temperatures,
     ).view(bs, gamma)
 
 
@@ -224,7 +258,15 @@ class _DflashDraftSampler:
     """
 
     def __init__(
-        self, *, weight, block_size, num_org, org_vocab_start, max_bs, tp_group=None
+        self,
+        *,
+        weight,
+        block_size,
+        num_org,
+        org_vocab_start,
+        max_bs,
+        tp_group=None,
+        sts_temperatures=None,
     ):
         self.weight = weight
         self.block_size = int(block_size)
@@ -238,6 +280,13 @@ class _DflashDraftSampler:
         self.out = torch.empty((max_tokens,), dtype=torch.int64, device=device)
         self.confidence = torch.empty(
             (int(max_bs), self.gamma), dtype=torch.float32, device=device
+        )
+        # Tiled once: a capture-time buffer, since the graph replays against
+        # whatever rows were recorded. None keeps the uncalibrated softmax.
+        self.sts_temperatures = (
+            tile_sts_temperatures(sts_temperatures.to(device), int(max_bs))
+            if sts_temperatures is not None
+            else None
         )
         if self.tp_size > 1:
             # Static buffers (fixed addresses) keep the in-graph select replay-safe.
@@ -287,7 +336,9 @@ class _DflashDraftSampler:
         logits = torch.matmul(hs, self.weight[: self.num_org].T)
         if self.tp_size == 1:
             tokens = torch.argmax(logits, dim=-1).to(torch.long)
-            partition = _shifted_exp_partition(logits)
+            partition = _shifted_exp_partition(
+                logits, temperatures=self._row_temperatures(n)
+            )
             self._write_confidence(bs=bs, confidence=partition.reciprocal_())
             if self.org_vocab_start:
                 tokens += self.org_vocab_start
@@ -297,7 +348,11 @@ class _DflashDraftSampler:
         local_arg = self.local_arg[:n]
         torch.max(logits, dim=-1, out=(local_max, local_arg))
         local_partition = self.local_partition[:n]
-        local_partition.copy_(_shifted_exp_partition(logits, maxima=local_max))
+        local_partition.copy_(
+            _shifted_exp_partition(
+                logits, maxima=local_max, temperatures=self._row_temperatures(n)
+            )
+        )
         local_max_f32 = self.local_max_f32[:n]
         local_max_f32.copy_(local_max)
         if self.org_vocab_start:
@@ -320,8 +375,12 @@ class _DflashDraftSampler:
             confidence=_merge_shard_partitions(
                 partitions=gathered_partition.view(self.tp_size, n),
                 maxima=gathered_max_f32.view(self.tp_size, n),
+                temperatures=self._row_temperatures(n),
             ),
         )
+
+    def _row_temperatures(self, n: int) -> Optional[torch.Tensor]:
+        return None if self.sts_temperatures is None else self.sts_temperatures[:n]
 
     def _write_confidence(self, *, bs: int, confidence: torch.Tensor) -> None:
         self.confidence[:bs].copy_(confidence.view(bs, self.gamma))
@@ -715,6 +774,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         self._maybe_merge_trained_mask_embedding()
         self._cache_full_embed_weight()
+        self._sts_temperatures = self._load_sts_temperatures()
         self._verify_planner = self._build_verify_planner()
         # Shares DSpark's flag: the two workers now share the checker, and our
         # run scripts already export it.
@@ -1020,6 +1080,45 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         return result
 
+    def _load_sts_temperatures(self) -> Optional[torch.Tensor]:
+        """Per-position temperatures for the draft confidence, or None.
+
+        DFLASH has no confidence head, so its confidence is the drafted token's
+        max softmax probability and the calibration is a softmax temperature:
+        p_T = 1 / sum(exp((logit - max) / T_j)). DSpark's head applies the same
+        table as sigmoid(raw / T_j) to a single logit, so a table fit for one
+        form is meaningless for the other -- fit against whichever confidence
+        the runtime actually reports.
+        """
+        sts_path = get_spec().speculative_dspark_confidence_sts_path
+        if not sts_path:
+            return None
+        calibration = load_sts_calibration_from_path(sts_path)
+        temperatures = torch.tensor(
+            calibration.temperatures, dtype=torch.float32, device=self.device
+        )
+        gamma = int(self.block_size) - 1
+        if temperatures.numel() != gamma:
+            raise ValueError(
+                "DFLASH STS calibration was fit for gamma="
+                f"{temperatures.numel()} but the runtime gamma is {gamma}; refit "
+                f"the table for gamma={gamma} or omit "
+                "--speculative-dspark-confidence-sts-path."
+            )
+        if bool((temperatures <= 0).any()):
+            raise ValueError(
+                f"DFLASH STS temperatures must be positive, got "
+                f"{calibration.temperatures}."
+            )
+        if self.model_runner.tp_rank == 0:
+            logger.info(
+                "DFLASH STS calibration loaded from %s (gamma=%d); per-position "
+                "temperatures applied to the draft's softmax confidence.",
+                sts_path,
+                gamma,
+            )
+        return temperatures
+
     def _build_verify_planner(self) -> Optional[DSparkVerifyPlanner]:
         """Per-request verify budget planner, or None when every step verifies
         the whole block.
@@ -1215,6 +1314,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             org_vocab_start=org_vocab_start,
             max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
             tp_group=tp_group if tp_group.world_size > 1 else None,
+            sts_temperatures=self._sts_temperatures,
         )
 
     def _init_fused_kv_helper(self) -> None:

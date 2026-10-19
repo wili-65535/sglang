@@ -6,9 +6,10 @@ off the logits the greedy draft sampler already computes. Greedy picks the
 argmax, so that probability is exactly 1/sum(exp(logit - max)) and the chosen
 logit never has to be gathered back.
 
-The derivations pinned here: the reciprocal-of-shifted-partition identity, and
-the per-shard re-centering that makes the tensor-parallel result independent of
-which rank owns the global max.
+The derivations pinned here: the reciprocal-of-shifted-partition identity, the
+per-shard re-centering that makes the tensor-parallel result independent of
+which rank owns the global max, and the STS temperature that rides inside the
+exponent of both.
 """
 
 import unittest
@@ -21,6 +22,7 @@ from sglang.srt.speculative.dflash_worker_v2 import (
     _merge_shard_partitions,
     _shifted_exp_partition,
     draft_confidence_from_head,
+    tile_sts_temperatures,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -192,6 +194,74 @@ class TestEagerDraftConfidence(unittest.TestCase):
                 gamma=7,
             )
         )
+
+
+class TestDflashStsTemperatures(unittest.TestCase):
+    """Post-hoc calibration of the draft confidence.
+
+    DFLASH has no confidence head, so its calibration is a softmax temperature
+    applied inside the exponent: p_T = 1 / sum(exp((logit - max) / T_j)). It
+    cannot be applied to the finished probability, and the tensor-parallel
+    merge re-centers on the global max, so the same temperature has to divide
+    the re-centering too.
+    """
+
+    def setUp(self):
+        torch.manual_seed(0)
+        self.bs, self.gamma, self.vocab = 3, 7, 257
+        self.logits = torch.randn(self.bs * self.gamma, self.vocab) * 4.0
+        self.temperatures = torch.tensor([0.5, 0.8, 1.0, 1.3, 2.0, 3.0, 0.9])
+        self.rows = tile_sts_temperatures(self.temperatures, self.bs)
+
+    def _reference(self, rows: torch.Tensor) -> torch.Tensor:
+        return torch.softmax(self.logits / rows.unsqueeze(-1), dim=-1).amax(dim=-1)
+
+    def test_identity_temperatures_leave_the_confidence_untouched(self):
+        # Guards the off switch: a table of ones must not perturb a single bit,
+        # or loading one would quietly move every budget decision.
+        ones = tile_sts_temperatures(torch.ones(self.gamma), self.bs)
+        plain = _shifted_exp_partition(self.logits.clone()).reciprocal_()
+        calibrated = _shifted_exp_partition(
+            self.logits.clone(), temperatures=ones
+        ).reciprocal_()
+        self.assertTrue(torch.equal(plain, calibrated))
+
+    def test_temperature_matches_an_explicit_temperature_softmax(self):
+        got = _shifted_exp_partition(
+            self.logits.clone(), temperatures=self.rows
+        ).reciprocal_()
+        torch.testing.assert_close(got, self._reference(self.rows))
+
+    def test_each_position_carries_its_own_temperature(self):
+        # Guards the tiling: the logit rows are request-major, position-minor,
+        # so a transposed tile would hand position j the wrong temperature and
+        # still produce plausible numbers.
+        got = _shifted_exp_partition(
+            self.logits.clone(), temperatures=self.rows
+        ).reciprocal_()
+        per_row = torch.stack(
+            [
+                torch.softmax(self.logits[i] / self.temperatures[i % self.gamma], -1)
+                .amax()
+                for i in range(self.bs * self.gamma)
+            ]
+        )
+        torch.testing.assert_close(got, per_row)
+
+    def test_shard_merge_carries_the_temperature(self):
+        # Guards the merge: with tp=1 the re-centering is a no-op, so dropping
+        # the temperature there passes every single-rank test and only skews
+        # the confidence once the vocabulary is actually sharded.
+        tp = 4
+        shards = self.logits.chunk(tp, dim=-1)
+        partitions = torch.stack(
+            [_shifted_exp_partition(s.clone(), temperatures=self.rows) for s in shards]
+        )
+        maxima = torch.stack([s.amax(dim=-1) for s in shards])
+        merged = _merge_shard_partitions(
+            partitions=partitions, maxima=maxima, temperatures=self.rows
+        )
+        torch.testing.assert_close(merged, self._reference(self.rows))
 
 
 if __name__ == "__main__":
