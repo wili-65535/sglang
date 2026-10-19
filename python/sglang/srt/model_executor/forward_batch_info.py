@@ -1389,9 +1389,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         else:
             # Ragged verify rows differ in width, so there is no [bs, width]
             # view for the [bs, 1] delta to broadcast over; expand per token.
-            flat_positions = seq_positions.view(-1) + torch.repeat_interleave(
+            flat = seq_positions.view(-1)
+            deltas = torch.repeat_interleave(
                 mrope_delta_tensor.view(-1), ragged_layout.verify_lens
             )
+            if deltas.shape[0] < flat.shape[0]:
+                # The window is padded up to layout.graph_num_tokens, so its
+                # tail slots belong to no request and verify_lens cannot cover
+                # them; they carry no delta and the forward discards them.
+                deltas = torch.nn.functional.pad(
+                    deltas, (0, flat.shape[0] - deltas.shape[0])
+                )
+            flat_positions = flat + deltas
         next_input_positions = flat_positions.unsqueeze(0).repeat(3, 1)
 
         self.mrope_positions = next_input_positions
