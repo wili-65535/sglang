@@ -3243,6 +3243,13 @@ class DFlashWorkerV2(BaseSpecWorker):
             logits_output=logits_output,
             next_token_ids=out_tokens.reshape(-1),
             accept_lens=commit_lens,
+            # What the scheduler averages into the "cap len" line; without it a
+            # budgeted run is indistinguishable from verify-all in the log.
+            cap_lens=(
+                None
+                if ragged_layout is None
+                else ragged_layout.verify_lens.to(torch.int32)
+            ),
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
             speculative_num_draft_tokens=int(self.block_size),
