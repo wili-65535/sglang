@@ -1,4 +1,4 @@
-"""Layout-independent commit invariant for DSpark target verify."""
+"""Layout-independent commit invariant for DFLASH-family target verify."""
 
 from typing import Optional
 
@@ -53,6 +53,6 @@ def check_commit_prefix(
             f"target={target_predict[i, :n].tolist()}"
         )
     raise ValueError(
-        f"DSpark commit prefix check failed at forward_ct={forward_ct}: "
+        f"Spec commit prefix check failed at forward_ct={forward_ct}: "
         f"{len(rows)}/{bs} requests. " + " | ".join(details)
     )

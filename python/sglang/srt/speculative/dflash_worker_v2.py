@@ -17,6 +17,10 @@ from sglang.kernels.ops.speculative.dflash import (
 from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     accept_sampling,
 )
+from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
+    BuildRaggedVerifyWindow,
+    ScatterCompactToStrided,
+)
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
@@ -73,13 +77,21 @@ from sglang.srt.speculative.draft_worker_common import (
     make_draft_input_v2,
     make_draft_sampler_capture_hook,
 )
+from sglang.srt.speculative.dspark_components.dspark_commit_check import (
+    check_commit_prefix,
+)
 from sglang.srt.speculative.dspark_components.dspark_draft import resolve_greedy_mask
+from sglang.srt.speculative.dspark_components.dspark_planner import DSparkVerifyPlanner
 from sglang.srt.speculative.lilicorr_utils import (
     build_lilicorr_draft_sampler,
     propose_lilicorr_block,
     publish_anchor,
     resolve_sampling_enabled,
     target_input_embeddings,
+)
+from sglang.srt.speculative.ragged_verify import (
+    RaggedVerifyMode,
+    read_ragged_verify_mode,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
@@ -313,6 +325,36 @@ class _DflashDraftSampler:
 
     def _write_confidence(self, *, bs: int, confidence: torch.Tensor) -> None:
         self.confidence[:bs].copy_(confidence.view(bs, self.gamma))
+
+
+def accept_within_verify_lens(
+    *,
+    candidates: torch.Tensor,
+    target_predict: torch.Tensor,
+    verify_lens: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Greedy accept confined to the rows compact verify actually ran.
+
+    Row j of the window predicts candidate j+1, so a request that verified k
+    rows can reach accept_len == k by matching candidate k off the last real
+    row -- one past what its KV budget covers. Clamping to k-1 costs nothing:
+    the bonus is then read from row k-1 and is that same candidate k, so it
+    still leaves the step as a committed token, just as the bonus instead of
+    as an accepted draft.
+
+    Greedy only: the clamp re-reads the bonus from the target argmax, which the
+    sampling accept paths never materialize.
+    """
+    accept_len, _ = compute_dflash_correct_drafts_and_bonus(
+        candidates=candidates, target_predict=target_predict
+    )
+    cap = verify_lens.to(device=accept_len.device, dtype=accept_len.dtype) - 1
+    accept_len = torch.minimum(accept_len, cap)
+    bonus = target_predict.gather(
+        1, accept_len.to(torch.int64).unsqueeze(1)
+    ).squeeze(1)
+    out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
+    return accept_len, bonus, out_tokens, commit_lens
 
 
 def _commit_accept(candidates, accept_len, bonus_tokens):
@@ -631,6 +673,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         self._maybe_merge_trained_mask_embedding()
         self._cache_full_embed_weight()
+        self._verify_planner = self._build_verify_planner()
+        # Shares DSpark's flag: the two workers now share the checker, and our
+        # run scripts already export it.
+        self._debug_commit_prefix = envs.SGLANG_DSPARK_DEBUG_COMMIT_PREFIX.get()
         if self.model_runner.tp_rank == 0:
             logger.info(
                 "Initialized DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s, draft_window_size=%s, compact_cache=%s",
@@ -923,6 +969,83 @@ class DFlashWorkerV2(BaseSpecWorker):
             result.sampling_headroom_bytes,
         )
         return result
+
+    def _build_verify_planner(self) -> Optional[DSparkVerifyPlanner]:
+        """Per-request verify budget planner, or None when every step verifies
+        the whole block.
+
+        DFLASH has no confidence head, so the planner is told the confidence
+        arrives from outside: the draft sampler derives it from its logits.
+        The draft heads that do not produce one are refused here rather than
+        silently falling back to verify-all, which would look like a working
+        adaptive run that never adapts.
+        """
+        if read_ragged_verify_mode() is RaggedVerifyMode.STATIC:
+            return None
+        unsupported = (
+            "selector (DFlash2)"
+            if self.selector is not None
+            else (
+                "lilicorr"
+                if self.lilicorr is not None
+                else "domino" if self._is_domino else None
+            )
+        )
+        if unsupported is not None:
+            raise ValueError(
+                f"SGLANG_RAGGED_VERIFY_MODE schedules per-request verify lengths "
+                f"from the draft's per-token confidence, which the {unsupported} "
+                f"draft head does not produce. Run SGLANG_RAGGED_VERIFY_MODE=static, "
+                f"or use a plain DFLASH draft."
+            )
+        if get_parallel().enable_dp_attention:
+            raise ValueError(
+                "DFLASH ragged verify does not support --enable-dp-attention yet: "
+                "the graph tier has to be agreed across DP ranks, and this worker "
+                "schedules the budget from its own batch only. Run "
+                "SGLANG_RAGGED_VERIFY_MODE=static, or drop dp attention."
+            )
+        return DSparkVerifyPlanner(
+            draft_model=self.draft_model,
+            gamma=int(self.block_size) - 1,
+            model_runner=self.model_runner,
+            device=self.device,
+            tp_rank=self.model_runner.tp_rank,
+            verify_num_draft_tokens=int(self.block_size),
+            tp_sync=self._tp_sync,
+            external_confidence=True,
+        )
+
+    def _resolve_ragged_layout(self, *, batch, draft_confidence, prefix_lens, device):
+        """This step's per-request verify lengths, or None to verify the whole
+        block for everyone.
+
+        Sampled batches keep the full window: trimming it needs the target's
+        own argmax to re-read the bonus at the trimmed row, which the sampling
+        accept paths never materialize.
+        """
+        if self._verify_planner is None or draft_confidence is None:
+            return None
+        if not _is_all_greedy(batch.sampling_info):
+            self._verify_planner.note_non_decode_step()
+            return None
+        # Computed here rather than through resolve_verify_token_budget: that
+        # one reads a field the scheduler fills ahead of the step via DSpark's
+        # prepare hook, which DFLASH does not register, so under overlap it
+        # would come back unset and the budget would silently be verify-all.
+        # The cost is a host sync on the confidence every step.
+        budget = self._verify_planner.compute_budget_sync(
+            confidence=draft_confidence,
+            prefix_lens=prefix_lens,
+            req_pool_indices=batch.req_pool_indices,
+        )
+        return self._verify_planner.schedule_layout(
+            req_pool_indices=batch.req_pool_indices,
+            prefix_lens=prefix_lens,
+            device=device,
+            confidence=draft_confidence,
+            budget=budget,
+        )
 
     def _maybe_build_draft_sampler(self):
         def _eager(reason):
@@ -2249,10 +2372,28 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_input,
         prefix_lens: torch.Tensor,
         bs: int,
+        verify_lens: Optional[torch.Tensor] = None,
     ):
         new_seq_lens = None
         target_predict = None
-        if self._selector_sample is not None:
+        if verify_lens is not None:
+            # Compact verify ran only verify_lens[i] of this request's rows, so
+            # the chain cannot be accepted past them -- beyond that the target's
+            # prediction comes from a zero-filled padding row. Clamping loses
+            # nothing: the draft token at the boundary comes back as the bonus,
+            # read from the last real row. Only reached on all-greedy batches
+            # (see _resolve_ragged_layout), which is what makes the re-read of
+            # the bonus from the target argmax available.
+            target_predict = torch.argmax(next_token_logits, dim=-1).view(
+                bs, int(self.block_size)
+            )
+            self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_GREEDY, target_predict)
+            accept_len, bonus, out_tokens, commit_lens = accept_within_verify_lens(
+                candidates=candidates,
+                target_predict=target_predict,
+                verify_lens=verify_lens,
+            )
+        elif self._selector_sample is not None:
             selector_candidate_ids, selector_q_rows = self._selector_sample
             accept_len, bonus = self._selector_sampling_accept(
                 candidates=candidates,
@@ -2695,6 +2836,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_out = self.draft_model_runner.forward(forward_batch)
         draft_logits_output = draft_out.logits_output
 
+        # Set by the two branches a confidence can be derived from; the planner
+        # refused the other draft heads at startup.
+        draft_confidence = None
+
         if (
             self._is_domino
             and self._draft_sampler is not None
@@ -2739,6 +2884,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_next = self._draft_sampler.out[
                 : bs * (int(self.block_size) - 1)
             ].view(bs, int(self.block_size) - 1)
+            if self._verify_planner is not None:
+                draft_confidence = self._draft_sampler.confidence[:bs]
             if (
                 self.selector is not None
                 and not _is_all_greedy(batch.sampling_info)
@@ -2808,20 +2955,42 @@ class DFlashWorkerV2(BaseSpecWorker):
             if draft_hidden is None:
                 raise RuntimeError("DFLASH draft model returned no hidden states.")
             draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
+            drafted_hidden = draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1])
             with self.draft_tp_context(
                 self.draft_model_runner.tp_group,
                 owns_attention=self.draft_owns_attention,
             ):
                 draft_next = self._greedy_sample_from_vocab_parallel_head(
-                    hidden_states=draft_hidden[:, 1:, :].reshape(
-                        -1, draft_hidden.shape[-1]
-                    ),
+                    hidden_states=drafted_hidden,
                     lm_head=lm_head,
                 ).view(bs, int(self.block_size) - 1)
+                if self._verify_planner is not None:
+                    draft_confidence = draft_confidence_from_head(
+                        hidden_states=drafted_hidden,
+                        lm_head=lm_head,
+                        bs=bs,
+                        gamma=int(self.block_size) - 1,
+                        tp_group=get_parallel().tp_group,
+                    )
 
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
+
+        # --- 1b) Per-request verify budget.
+        # The draft always proposed the whole block; the budget only decides how
+        # much of it the target verifies this step.
+        ragged_layout = self._resolve_ragged_layout(
+            batch=batch,
+            draft_confidence=draft_confidence,
+            prefix_lens=prefix_lens,
+            device=device,
+        )
+        # cap-accept keeps the full window and only trims what may be committed;
+        # compact is the mode that repacks the rows.
+        run_compact = ragged_layout is not None and (
+            self._verify_planner.should_run_compact(layout=ragged_layout)
+        )
 
         # Must stay ahead of the target verify launch below.
         grammar_tree = (
@@ -2832,16 +3001,41 @@ class DFlashWorkerV2(BaseSpecWorker):
         # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
         custom_mask = None
 
-        verify_input_ids = draft_tokens.reshape(-1)
-        verify_input = DFlashVerifyInput(
-            draft_token=verify_input_ids,
-            positions=positions,
-            draft_token_num=int(self.block_size),
-            custom_mask=custom_mask,
-            capture_hidden_mode=CaptureHiddenMode.FULL,
-        )
+        if not run_compact:
+            verify_input = DFlashVerifyInput(
+                draft_token=draft_tokens.reshape(-1),
+                positions=positions,
+                draft_token_num=int(self.block_size),
+                custom_mask=custom_mask,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+            )
+            batch.out_cache_loc = verify_out_cache_loc
+        else:
+            # Packed window: each request contributes verify_lens[i] rows instead
+            # of a full block, so the ids/positions/cache locs are repacked. The
+            # dense block_size window above still owns the commit, which writes
+            # the committed prefix back at the request's own offsets.
+            ragged_window = BuildRaggedVerifyWindow.execute(
+                batch=batch,
+                layout=ragged_layout,
+                draft_block_ids=block_ids,
+                draft_tokens=draft_next,
+                bs=bs,
+                device=device,
+                verify_num_draft_tokens=int(self.block_size),
+                model_runner=self.model_runner,
+            )
+            verify_input = DFlashVerifyInput(
+                draft_token=ragged_window.verify_ids,
+                positions=ragged_window.positions,
+                draft_token_num=int(self.block_size),
+                custom_mask=custom_mask,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+                ragged_verify_layout=ragged_layout,
+                live_seq_lens_cpu=batch.seq_lens_cpu,
+            )
+            batch.out_cache_loc = ragged_window.verify_cache_loc
 
-        batch.out_cache_loc = verify_out_cache_loc
         sampling_info = batch.sampling_info
 
         seq_lens_pre_verify = (
@@ -2850,8 +3044,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         seq_lens_cpu_backup = batch.seq_lens_cpu
         seq_lens_sum_backup = batch.seq_lens_sum
         if seq_lens_cpu_backup is not None:
-            # Verify host bound = committed prefix + one verify block (matches draft).
-            verify_host_seq_lens = seq_lens_cpu_backup + block_size
+            # Verify host bound = committed prefix + what this step verifies.
+            if not run_compact:
+                verify_host_seq_lens = seq_lens_cpu_backup + block_size
+            else:
+                step_lens = ragged_layout.verify_lens.to(
+                    device="cpu", dtype=seq_lens_cpu_backup.dtype
+                )
+                verify_host_seq_lens = seq_lens_cpu_backup + step_lens
             batch.seq_lens_cpu = verify_host_seq_lens
             batch.seq_lens_sum = int(verify_host_seq_lens.sum())
         elif draft_input.nxt_kv_lens_cpu is not None:
@@ -2890,6 +3090,28 @@ class DFlashWorkerV2(BaseSpecWorker):
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
 
+        if run_compact:
+            # Back to [bs, block_size] rows so accept, the logits adjustments and
+            # the commit all keep working on the dense block they were written
+            # for. Padded rows carry zeros; the accept cutoff below keeps them
+            # from being read.
+            logits_output.next_token_logits = ScatterCompactToStrided.execute(
+                compact=logits_output.next_token_logits,
+                layout=ragged_layout,
+                fill_value=0.0,
+                verify_num_draft_tokens=int(self.block_size),
+            )
+            if logits_output.hidden_states is None:
+                raise RuntimeError(
+                    "DFLASH compact verify requires target hidden states, got None."
+                )
+            logits_output.hidden_states = ScatterCompactToStrided.execute(
+                compact=logits_output.hidden_states,
+                layout=ragged_layout,
+                fill_value=0.0,
+                verify_num_draft_tokens=int(self.block_size),
+            )
+
         grammar_mask = None
         if batch.has_grammar:
             grammar_mask = build_grammar_vocab_mask(
@@ -2926,7 +3148,20 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_input=draft_input,
             prefix_lens=prefix_lens,
             bs=bs,
+            verify_lens=None if ragged_layout is None else ragged_layout.verify_lens,
         )
+
+        if self._debug_commit_prefix and _is_all_greedy(sampling_info):
+            check_commit_prefix(
+                out_tokens=out_tokens,
+                commit_lens=commit_lens,
+                target_logits=logits_output.next_token_logits,
+                verify_lens=(
+                    None if ragged_layout is None else ragged_layout.verify_lens
+                ),
+                stride=int(self.block_size),
+                forward_ct=int(batch.forward_iter),
+            )
 
         if SIMULATE_ACC_LEN > 0:
             if SIMULATE_ACC_TOKEN_MODE not in ("fixed", "real-draft-token"):
