@@ -173,6 +173,11 @@ class QSAMTPSharedSparseIndices:
 class QwenSparseAttnBackend(AttentionBackend):
     """QSA backend using trtllm-gen decode with a packed FA2/FA4 fallback."""
 
+    # Ragged verify under cuda graph: the layout kernel's mode 3 packs the
+    # rows at per-request widths and the tail rows land on the inert request
+    # slot 0, so replay needs no host readback and no shape change.
+    supports_ragged_verify_graph: bool = True
+
     # Every seq_lens_cpu read here has a device fallback (one readback);
     # the graphed decode path never reads it, so opting out is safe.
     needs_cpu_seq_lens: bool = False
@@ -344,6 +349,25 @@ class QwenSparseAttnBackend(AttentionBackend):
             return values[:size].detach().cpu().to(torch.int32)
         return torch.tensor(values[:size], dtype=torch.int32)
 
+    @staticmethod
+    def _ragged_verify_lens(spec_info, bs: int):
+        """Per-request verify widths for this step, or None for uniform width.
+
+        Capped at draft_token_num on purpose. The full-coverage variant spreads
+        the graph tier's leftover tokens over the real requests, and QSA keys
+        its pending ring on (request, position), so those surplus rows would
+        write into a live request's ring. Capped, they fall past the packed
+        layout and the layout kernel's tail hands them request slot 0, which is
+        never allocated and therefore inert.
+        """
+        layout = spec_info.ragged_verify_layout
+        if layout is None:
+            return None
+        cap = int(spec_info.draft_token_num)
+        if layout.bs != bs or layout.cap != cap:
+            layout = layout.padded_to_bucket(padded_bs=bs, cap=cap)
+        return layout.verify_lens
+
     @classmethod
     def _graph_speculative_layout(
         cls,
@@ -357,8 +381,12 @@ class QwenSparseAttnBackend(AttentionBackend):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         base_lengths = cls._as_cpu_int_tensor(seq_lens_cpu, bs)
         if forward_mode.is_target_verify():
-            extend_len = int(spec_info.draft_token_num)
-            extend_lengths = torch.full((bs,), extend_len, dtype=torch.int32)
+            verify_lens = cls._ragged_verify_lens(spec_info, bs)
+            if verify_lens is None:
+                extend_len = int(spec_info.draft_token_num)
+                extend_lengths = torch.full((bs,), extend_len, dtype=torch.int32)
+            else:
+                extend_lengths = verify_lens.to(device="cpu", dtype=torch.int32)
         else:
             extend_lengths_cpu = getattr(spec_info, "extend_seq_lens_cpu", None)
             if extend_lengths_cpu is not None:
@@ -1053,9 +1081,19 @@ class QwenSparseAttnBackend(AttentionBackend):
 
         if speculative:
             if forward_mode.is_target_verify():
-                mode = 1
-                extend_lens = None
-                extend_len = int(spec_info.draft_token_num)
+                extend_lens = self._ragged_verify_lens(spec_info, bs)
+                if extend_lens is None:
+                    mode = 1
+                    extend_len = int(spec_info.draft_token_num)
+                else:
+                    # Ragged verify: the rows are packed at per-request widths,
+                    # so the uniform stride of mode 1 would misplace every
+                    # request after the first.
+                    mode = 3
+                    extend_len = 0
+                    extend_lens = extend_lens.to(
+                        device=seq_lens.device, dtype=torch.int32
+                    )
             else:
                 mode = 2
                 extend_len = 0

@@ -518,6 +518,12 @@ class GDNKernelDispatcher:
 class GDNAttnBackend(MambaAttnBackendBase):
     """Attention backend for GDN (Gated Delta Network) linear attention."""
 
+    # Same shape as KDA: the verify path scatters the packed ragged tokens to
+    # its dense [bs, draft_token_num] layout off query_start_loc, which replay
+    # refreshes in place, so nothing here reads back to the host or changes
+    # shape between replays.
+    supports_ragged_verify_graph: bool = True
+
     needs_cpu_seq_lens: bool = False
     supports_mis: bool = True
 

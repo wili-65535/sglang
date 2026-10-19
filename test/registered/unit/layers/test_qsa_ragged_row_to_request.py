@@ -1,4 +1,4 @@
-"""Unit tests for QSA's speculative row-to-request map — CPU-only.
+"""Unit tests for QSA's speculative row layout under ragged verify — CPU-only.
 
 Bug regression: with compact ragged verify each request gets its own verify
 budget and the rows are packed end to end, so the packed row count is not a
@@ -79,6 +79,48 @@ class TestQsaRaggedRowToRequest(unittest.TestCase):
         batch = _batch(2, verify_lens=[4, 4])
         with self.assertRaises(ValueError):
             QwenSparseAttnBackend._speculative_row_to_request(batch, 5)
+
+
+class TestQsaRaggedVerifyLens(unittest.TestCase):
+    """The widths QSA lays its cuda-graph rows out by.
+
+    QSA keys its pending ring on (request, position). The full-coverage layout
+    variant spreads the graph tier's leftover tokens over the real requests, so
+    taking it here would let surplus rows write into a live request's ring; the
+    capped variant pushes them past the packed layout, where the layout
+    kernel's tail hands them the never-allocated request slot 0.
+    """
+
+    @staticmethod
+    def _spec(verify_lens, draft_token_num=8):
+        return SimpleNamespace(
+            ragged_verify_layout=None if verify_lens is None else _layout(verify_lens),
+            draft_token_num=draft_token_num,
+        )
+
+    def test_uniform_width_reports_no_ragged_lens(self):
+        # No layout means every request verifies the full block, which the
+        # layout kernel's uniform-stride mode already covers.
+        self.assertIsNone(
+            QwenSparseAttnBackend._ragged_verify_lens(self._spec(None), 4)
+        )
+
+    def test_widths_come_back_per_request(self):
+        lens = QwenSparseAttnBackend._ragged_verify_lens(self._spec([2, 5, 1, 8]), 4)
+        self.assertEqual(lens.tolist(), [2, 5, 1, 8])
+
+    def test_padding_requests_are_appended(self):
+        # Replay pads the batch to the captured slot count; the padded entries
+        # must exist so the kernel's per-request prefix sum stays aligned.
+        lens = QwenSparseAttnBackend._ragged_verify_lens(self._spec([3, 4]), 4)
+        self.assertEqual(len(lens.tolist()), 4)
+        self.assertEqual(lens.tolist()[:2], [3, 4])
+
+    def test_no_row_exceeds_the_draft_block(self):
+        # The guard that keeps surplus rows out of a live request's ring: the
+        # uncapped variant would hand some request the tier's leftover tokens.
+        lens = QwenSparseAttnBackend._ragged_verify_lens(self._spec([3, 4]), 4)
+        self.assertLessEqual(max(lens.tolist()), 8)
 
 
 if __name__ == "__main__":
