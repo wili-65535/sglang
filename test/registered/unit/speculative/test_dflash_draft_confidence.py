@@ -12,6 +12,7 @@ which rank owns the global max.
 """
 
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -19,6 +20,7 @@ from sglang.srt.speculative.dflash_worker_v2 import (
     _DflashDraftSampler,
     _merge_shard_partitions,
     _shifted_exp_partition,
+    draft_confidence_from_head,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -130,6 +132,66 @@ class TestDflashDraftConfidence(unittest.TestCase):
 
         self.assertGreater(float(sampler.confidence[0].min()), 0.99)
         self.assertAlmostEqual(float(sampler.confidence[1].max()), 1.0 / vocab, places=5)
+
+
+class TestEagerDraftConfidence(unittest.TestCase):
+    """The eager draft path discards its logits, so confidence comes from a
+    second pass over the head. It has to agree with the folded path's buffer
+    and has to refuse the head shapes it cannot derive."""
+
+    def _head(self, weight, shard=None):
+        return SimpleNamespace(weight=weight, shard_indices=shard)
+
+    def test_matches_the_folded_sampler_on_the_same_inputs(self):
+        # The two paths are separate implementations of the same quantity; a
+        # drift between them would show up only as a worse budget.
+        torch.manual_seed(5)
+        vocab, hidden, block_size, bs = 64, 8, 8, 3
+        weight = torch.randn(vocab, hidden) * 0.3
+        sampler = _DflashDraftSampler(
+            weight=weight,
+            block_size=block_size,
+            num_org=vocab,
+            org_vocab_start=0,
+            max_bs=bs,
+            tp_group=None,
+        )
+        hidden_states = torch.randn(bs * block_size, hidden)
+        sampler(hidden_states)
+        drafted = hidden_states.view(bs, block_size, hidden)[:, 1:, :]
+        eager = draft_confidence_from_head(
+            hidden_states=drafted.reshape(-1, hidden),
+            lm_head=self._head(weight),
+            bs=bs,
+            gamma=block_size - 1,
+        )
+        torch.testing.assert_close(eager, sampler.confidence[:bs])
+
+    def test_refuses_an_added_vocab_shard(self):
+        # An added-vocab shard splits a row across two weight slices, which this
+        # single-slice derivation would silently read as the whole vocabulary.
+        weight = torch.randn(64, 8)
+        shard = SimpleNamespace(
+            num_org_elements=32, org_vocab_start_index=0, num_added_elements=4
+        )
+        self.assertIsNone(
+            draft_confidence_from_head(
+                hidden_states=torch.randn(7, 8),
+                lm_head=self._head(weight, shard),
+                bs=1,
+                gamma=7,
+            )
+        )
+
+    def test_refuses_a_head_without_a_dense_weight(self):
+        self.assertIsNone(
+            draft_confidence_from_head(
+                hidden_states=torch.randn(7, 8),
+                lm_head=SimpleNamespace(weight=None, shard_indices=None),
+                bs=1,
+                gamma=7,
+            )
+        )
 
 
 if __name__ == "__main__":

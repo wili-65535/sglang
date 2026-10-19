@@ -143,6 +143,57 @@ def _merge_shard_partitions(
     return (partitions * (maxima - global_max).exp()).sum(dim=0).reciprocal_()
 
 
+def draft_confidence_from_head(
+    *, hidden_states: torch.Tensor, lm_head, bs: int, gamma: int, tp_group=None
+) -> Optional[torch.Tensor]:
+    """[bs, gamma] confidence for drafted tokens, off a second pass over the
+    target head. None when the head's shape rules the derivation out.
+
+    The folded draft sampler publishes this for free, having already built the
+    logits; this is the eager path, which discards them inside its chunked
+    argmax. The adaptive budget only needs the numbers once per step, so paying
+    one more small matmul here beats threading the partition through every
+    sampling branch.
+
+    A quantized head has no dense weight to slice, and an added-vocab shard
+    splits the row across two slices; neither is derived here, and the caller
+    is expected to refuse the adaptive budget rather than guess.
+    """
+    weight = getattr(lm_head, "weight", None)
+    if not is_dense_head_weight(weight):
+        return None
+    shard = getattr(lm_head, "shard_indices", None)
+    if shard is None:
+        num_org, num_added = int(weight.shape[0]), 0
+    else:
+        num_org = int(shard.num_org_elements)
+        num_added = int(shard.num_added_elements)
+    # The token id is the sampler's business; only the distribution matters here,
+    # so the shard's vocab offset never enters.
+    if num_added > 0 or num_org <= 0:
+        return None
+
+    hs = hidden_states
+    if hs.dtype != weight.dtype:
+        hs = hs.to(weight.dtype)
+    logits = torch.matmul(hs, weight[:num_org].T)
+    partition = _shifted_exp_partition(logits)
+    tp_size = 1 if tp_group is None else int(tp_group.world_size)
+    if tp_size == 1:
+        return partition.reciprocal_().view(bs, gamma)
+
+    n = partition.shape[0]
+    device = partition.device
+    gathered_partition = torch.empty((tp_size * n,), dtype=torch.float32, device=device)
+    gathered_max = torch.empty((tp_size * n,), dtype=torch.float32, device=device)
+    tp_group.all_gather_into_tensor(gathered_partition, partition)
+    tp_group.all_gather_into_tensor(gathered_max, logits.amax(dim=-1).float())
+    return _merge_shard_partitions(
+        partitions=gathered_partition.view(tp_size, n),
+        maxima=gathered_max.view(tp_size, n),
+    ).view(bs, gamma)
+
+
 class _DflashDraftSampler:
     """Capture-safe greedy argmax over the target LM head, run inside the draft
     cuda graph so the draft sampling is captured and counted in fwd_occupancy.
