@@ -39,6 +39,7 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip
 
 logger = logging.getLogger(__name__)
@@ -1082,6 +1083,10 @@ class QwenSparseAttnBackend(AttentionBackend):
         if speculative:
             if forward_mode.is_target_verify():
                 extend_lens = self._ragged_verify_lens(spec_info, bs)
+                if extend_lens is not None and envs.SGLANG_QSA_DEBUG_UNIFORM_MODE1.get():
+                    width = int(spec_info.draft_token_num)
+                    if bool((extend_lens[: bs - num_padding] == width).all()):
+                        extend_lens = None
                 if extend_lens is None:
                     mode = 1
                     extend_len = int(spec_info.draft_token_num)

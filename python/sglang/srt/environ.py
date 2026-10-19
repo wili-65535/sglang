@@ -1392,6 +1392,11 @@ class Envs:
     # is full width -- diff it against the dense window the static path would
     # have built. Debug only; it host-syncs on every verify.
     SGLANG_DFLASH_DEBUG_WINDOW = EnvBool(False)
+    # Bisect only: when every ragged verify width equals draft_token_num, lay
+    # the QSA graph rows out with the uniform-stride mode instead of the ragged
+    # one. The two are value-identical there, so a behavior change under this
+    # flag localizes a fault to the ragged mode's wiring.
+    SGLANG_QSA_DEBUG_UNIFORM_MODE1 = EnvBool(False)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
