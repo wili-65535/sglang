@@ -38,6 +38,7 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     sparse_gqa_packed_decode_triton,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.utils import is_hip
 
 logger = logging.getLogger(__name__)
@@ -288,11 +289,21 @@ class QwenSparseAttnBackend(AttentionBackend):
                 "QSA speculative query rows cannot be mapped to an empty batch: "
                 f"rows={num_rows}"
             )
+        layout = resolve_ragged_verify_layout(forward_batch)
         extend_seq_lens = getattr(forward_batch, "extend_seq_lens", None)
-        if extend_seq_lens is not None:
+        if layout is not None:
+            # Compact ragged verify packs the rows at per-request verify budgets,
+            # so rows/batch is not the stride; the row widths are the layout's.
+            repeats = layout.verify_lens[:batch_size].to(
+                device=forward_batch.req_pool_indices.device, dtype=torch.long
+            )
+        elif extend_seq_lens is not None:
+            repeats = extend_seq_lens[:batch_size].to(dtype=torch.long)
+        else:
+            repeats = None
+        if repeats is not None:
             # DP token padding rows belong to no request; alias them to request row 0,
             # as the CUDA-graph layout does, so gathers stay in bounds.
-            repeats = extend_seq_lens[:batch_size].to(dtype=torch.long)
             real_rows = int(repeats.sum().item())
             if real_rows > num_rows:
                 raise ValueError(
