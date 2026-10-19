@@ -1381,6 +1381,13 @@ class Envs:
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
+    # Pin every DFLASH draft token's confidence to this value instead of
+    # deriving it from the draft logits. A randomly initialized draft has a
+    # near-uniform output, so its real confidence sits below the planner's
+    # survival_eps and the budget collapses to one row per request; a constant
+    # makes the verify lengths selectable before trained weights exist.
+    # Negative = off (the derived confidence is used).
+    SGLANG_DFLASH_DEBUG_CONFIDENCE = EnvFloat(-1.0)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")

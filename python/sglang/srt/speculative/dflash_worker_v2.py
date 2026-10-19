@@ -677,6 +677,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         # Shares DSpark's flag: the two workers now share the checker, and our
         # run scripts already export it.
         self._debug_commit_prefix = envs.SGLANG_DSPARK_DEBUG_COMMIT_PREFIX.get()
+        self._debug_confidence = envs.SGLANG_DFLASH_DEBUG_CONFIDENCE.get()
+        if self._debug_confidence >= 0 and self.model_runner.tp_rank == 0:
+            logger.warning(
+                "DFLASH draft confidence pinned to %.4f by "
+                "SGLANG_DFLASH_DEBUG_CONFIDENCE; the verify budget is no longer "
+                "reading the draft. Debugging only.",
+                self._debug_confidence,
+            )
         if self.model_runner.tp_rank == 0:
             logger.info(
                 "Initialized DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s, draft_window_size=%s, compact_cache=%s",
@@ -1026,6 +1034,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         """
         if self._verify_planner is None or draft_confidence is None:
             return None
+        if self._debug_confidence >= 0:
+            draft_confidence = torch.full_like(
+                draft_confidence, float(self._debug_confidence)
+            )
         if not _is_all_greedy(batch.sampling_info):
             self._verify_planner.note_non_decode_step()
             return None
