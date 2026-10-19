@@ -1388,6 +1388,10 @@ class Envs:
     # makes the verify lengths selectable before trained weights exist.
     # Negative = off (the derived confidence is used).
     SGLANG_DFLASH_DEBUG_CONFIDENCE = EnvFloat(-1.0)
+    # Log the compact verify window's shape each step, and -- when every row
+    # is full width -- diff it against the dense window the static path would
+    # have built. Debug only; it host-syncs on every verify.
+    SGLANG_DFLASH_DEBUG_WINDOW = EnvBool(False)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")

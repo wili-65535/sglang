@@ -357,6 +357,48 @@ def accept_within_verify_lens(
     return accept_len, bonus, out_tokens, commit_lens
 
 
+def _log_ragged_window_debug(
+    *,
+    layout,
+    window,
+    dense_positions: torch.Tensor,
+    dense_cache_loc: torch.Tensor,
+    dense_ids: torch.Tensor,
+    block_size: int,
+) -> None:
+    """Report the compact window's shape, and its diff against the dense one.
+
+    At full width the two windows should agree value for value on the real
+    rows, so any diff here localizes the corruption to the repack itself; the
+    padded tail has no dense counterpart and is reported as a count.
+    """
+    verify_lens = layout.verify_lens.tolist()
+    real_total = sum(verify_lens)
+    pad = int(layout.graph_num_tokens) - real_total
+    msg = (
+        f"DFLASH ragged window: bs={len(verify_lens)} verify_lens={verify_lens} "
+        f"total={real_total} graph_num_tokens={layout.graph_num_tokens} pad={pad} "
+        f"cap={layout.cap}"
+    )
+    if all(v == block_size for v in verify_lens):
+        head = slice(0, real_total)
+        diffs = {
+            "positions": int(
+                (window.positions[head] != dense_positions[head]).sum().item()
+            ),
+            "cache_loc": int(
+                (window.verify_cache_loc[head] != dense_cache_loc[head]).sum().item()
+            ),
+            "ids": int(
+                (window.verify_ids[head] != dense_ids[head].to(window.verify_ids.dtype))
+                .sum()
+                .item()
+            ),
+        }
+        msg += f" full-width diff vs dense: {diffs}"
+    logger.info(msg)
+
+
 def _commit_accept(candidates, accept_len, bonus_tokens):
     """The committed block: drafted tokens shifted left, the bonus at the accept
     boundary. Returns it with the commit lengths."""
@@ -3037,6 +3079,15 @@ class DFlashWorkerV2(BaseSpecWorker):
                 verify_num_draft_tokens=int(self.block_size),
                 model_runner=self.model_runner,
             )
+            if envs.SGLANG_DFLASH_DEBUG_WINDOW.get():
+                _log_ragged_window_debug(
+                    layout=ragged_layout,
+                    window=ragged_window,
+                    dense_positions=positions,
+                    dense_cache_loc=verify_out_cache_loc,
+                    dense_ids=draft_tokens.reshape(-1),
+                    block_size=int(self.block_size),
+                )
             verify_input = DFlashVerifyInput(
                 draft_token=ragged_window.verify_ids,
                 positions=ragged_window.positions,
