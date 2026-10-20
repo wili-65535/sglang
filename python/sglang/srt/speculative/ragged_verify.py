@@ -178,6 +178,18 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
             PaddedToBucket,
         )
 
+        if envs.SGLANG_TEST_RAGGED_EMPTY_PAD_ROWS.get():
+            # Empty padding rows: the tier's leftover tokens stay unowned, which
+            # is what the verify window builds them as.
+            padded = torch.nn.functional.pad(
+                self.verify_lens.to(torch.int32), (0, padded_bs - self.bs)
+            )
+            return RaggedVerifyLayout._assemble_device(
+                verify_lens=padded,
+                graph_num_tokens=self.graph_num_tokens,
+                cap=cap,
+            )
+
         padded = PaddedToBucket.execute(
             verify_lens=self.verify_lens,
             graph_num_tokens=self.graph_num_tokens,

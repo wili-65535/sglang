@@ -1415,6 +1415,10 @@ class Envs:
     # rows while the synthetic capture layout stays in place. Only sound when
     # every verify width equals draft_token_num.
     SGLANG_TEST_RAGGED_CAPTURE_SLOTS_EXACT = EnvBool(False)
+    # Bisect only: pad the staged ragged layout with empty rows instead of
+    # spreading the graph tier's leftover tokens over the padding rows (or, with
+    # no padding rows, over the last real request).
+    SGLANG_TEST_RAGGED_EMPTY_PAD_ROWS = EnvBool(False)
     # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift
     # back to steps>0 starts from a cold draft state (low accept until it recovers).
