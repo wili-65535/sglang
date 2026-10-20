@@ -1397,6 +1397,9 @@ class Envs:
     # one. The two are value-identical there, so a behavior change under this
     # flag localizes a fault to the ragged mode's wiring.
     SGLANG_QSA_DEBUG_UNIFORM_MODE1 = EnvBool(False)
+    # Debug only: dump the row plan (slots, padding, widths, seq_lens,
+    # req_pool_indices) of this many ragged verify graph replays. It host-syncs.
+    SGLANG_QSA_DEBUG_RAGGED_ROWS = EnvInt(0)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")

@@ -233,6 +233,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._trtllm_workspace = None
         self._graph_extend_lens = None
         self._graph_extend_lens_pin = None
+        self._ragged_debug_left = envs.SGLANG_QSA_DEBUG_RAGGED_ROWS.get()
 
     @staticmethod
     def _is_speculative_paged_mode(forward_mode) -> bool:
@@ -1053,6 +1054,39 @@ class QwenSparseAttnBackend(AttentionBackend):
         staged[:bs].copy_(pin[:bs], non_blocking=True)
         return staged[:bs]
 
+    def _log_ragged_rows(
+        self,
+        *,
+        mode,
+        bs,
+        num_padding,
+        extend_lens,
+        seq_lens,
+        req_pool_indices,
+        spec_info,
+    ) -> None:
+        """Debug only: the ragged replay's row plan, including the slots the
+        tier padded in. Host-syncs, so it runs for a bounded number of steps."""
+        if self._ragged_debug_left <= 0:
+            return
+        self._ragged_debug_left -= 1
+        layout = spec_info.ragged_verify_layout
+        widths = None if extend_lens is None else extend_lens[:bs].tolist()
+        logger.info(
+            "qsa ragged replay: mode=%d slots=%d padding=%d width=%d "
+            "tier=%s layout_bs=%s cap=%s widths=%s seq_lens=%s req_pool=%s",
+            mode,
+            bs,
+            num_padding,
+            int(spec_info.draft_token_num),
+            None if layout is None else layout.graph_num_tokens,
+            None if layout is None else layout.bs,
+            None if layout is None else layout.cap,
+            widths,
+            seq_lens[:bs].tolist(),
+            req_pool_indices[:bs].tolist(),
+        )
+
     def _replay_cuda_graph_metadata_gpu(
         self,
         metadata,
@@ -1099,6 +1133,15 @@ class QwenSparseAttnBackend(AttentionBackend):
                     extend_lens = extend_lens.to(
                         device=seq_lens.device, dtype=torch.int32
                     )
+                self._log_ragged_rows(
+                    mode=mode,
+                    bs=bs,
+                    num_padding=num_padding,
+                    extend_lens=extend_lens,
+                    seq_lens=seq_lens,
+                    req_pool_indices=req_pool_indices,
+                    spec_info=spec_info,
+                )
             else:
                 mode = 2
                 extend_len = 0
