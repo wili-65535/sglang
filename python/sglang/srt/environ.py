@@ -1423,6 +1423,9 @@ class Envs:
     # full-width rows followed by empty ones -- instead of splitting the tier
     # evenly over the capture slots.
     SGLANG_TEST_RAGGED_CAPTURE_FULL_WIDTH = EnvBool(False)
+    # Bisect only: send ragged verify batches whose graph tier is below this
+    # many tokens down the eager path, leaving the larger tiers on the graph.
+    SGLANG_TEST_RAGGED_MIN_GRAPH_TIER = EnvInt(0)
     # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift
     # back to steps>0 starts from a cold draft state (low accept until it recovers).

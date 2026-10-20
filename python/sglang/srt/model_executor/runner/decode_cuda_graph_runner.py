@@ -769,6 +769,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return False
 
         admission_tokens = ragged_layout.graph_num_tokens
+        if admission_tokens < envs.SGLANG_TEST_RAGGED_MIN_GRAPH_TIER.get():
+            return False
         is_tokens_supported = admission_tokens <= self.capture_num_tokens[
             -1
         ] and forward_batch.batch_size <= self._ragged_capture_slots(admission_tokens)
