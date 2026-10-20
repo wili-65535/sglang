@@ -1429,6 +1429,9 @@ class Envs:
     # Bisect only: log each ragged verify tier's capture slots and widths, so a
     # replay-side row plan can be matched against what capture actually baked.
     SGLANG_TEST_RAGGED_LOG_CAPTURE = EnvBool(False)
+    # Bisect only: capture a single ragged verify tier; batches of every
+    # other tier fall back to the eager path.
+    SGLANG_TEST_RAGGED_ONLY_TIER = EnvInt(0)
     # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift
     # back to steps>0 starts from a cold draft state (low accept until it recovers).

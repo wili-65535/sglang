@@ -544,6 +544,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _build_ragged_verify_token_buckets(self) -> list[int]:
         buckets = sorted({bs * self.captured_req_width for bs in self.capture_bs})
         assert buckets and buckets[0] > 0, f"{buckets=}"
+        only = envs.SGLANG_TEST_RAGGED_ONLY_TIER.get()
+        if only:
+            # Bisect only: one tier captured means no other tier's capture can
+            # leave anything behind in the shared graph buffers.
+            assert only in buckets, f"{only=} not in {buckets=}"
+            return [only]
         return buckets
 
     def _autotune_buffers(self):
