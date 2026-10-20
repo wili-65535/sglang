@@ -1404,6 +1404,12 @@ class Envs:
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)
+    # Bisect only: take the dense (uniform-stride) branch in the PLE row layout
+    # or in GDN's conv update even when a ragged layout is attached. Only sound
+    # when every verify width equals draft_token_num -- the two are then
+    # value-identical, so a behavior change localizes the fault to that branch.
+    SGLANG_TEST_RAGGED_DENSE_PLE = EnvBool(False)
+    SGLANG_TEST_RAGGED_DENSE_GDN = EnvBool(False)
     # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift
     # back to steps>0 starts from a cold draft state (low accept until it recovers).
