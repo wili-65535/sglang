@@ -657,6 +657,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 grid=self.capture_num_tokens,
             )
         self._captured_ragged_layouts[num_tokens] = layout
+        if envs.SGLANG_TEST_RAGGED_LOG_CAPTURE.get():
+            logger.info(
+                "ragged capture: tier=%d slots=%d widths=%s",
+                num_tokens,
+                len(verify_lens_cpu),
+                verify_lens_cpu,
+            )
         return layout
 
     def _stage_ragged_verify_layout(self, ragged_layout, graph_size_key: int) -> None:

@@ -1426,6 +1426,9 @@ class Envs:
     # Bisect only: send ragged verify batches whose graph tier is below this
     # many tokens down the eager path, leaving the larger tiers on the graph.
     SGLANG_TEST_RAGGED_MIN_GRAPH_TIER = EnvInt(0)
+    # Bisect only: log each ragged verify tier's capture slots and widths, so a
+    # replay-side row plan can be matched against what capture actually baked.
+    SGLANG_TEST_RAGGED_LOG_CAPTURE = EnvBool(False)
     # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift
     # back to steps>0 starts from a cold draft state (low accept until it recovers).
