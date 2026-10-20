@@ -619,8 +619,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return not draft_is_deepseek_v4()
 
     def _ragged_capture_slots(self, num_tokens: int) -> int:
-        if envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.get():
-            return num_tokens // self.captured_req_width
+        if (
+            envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.get()
+            or envs.SGLANG_TEST_RAGGED_CAPTURE_SLOTS_EXACT.get()
+        ):
+            return max(1, num_tokens // self.captured_req_width)
         return min(num_tokens, self.max_bs)
 
     def _capture_ragged_verify_layout(self, num_tokens: int):

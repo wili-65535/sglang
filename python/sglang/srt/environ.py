@@ -1410,6 +1410,11 @@ class Envs:
     # value-identical, so a behavior change localizes the fault to that branch.
     SGLANG_TEST_RAGGED_DENSE_PLE = EnvBool(False)
     SGLANG_TEST_RAGGED_DENSE_GDN = EnvBool(False)
+    # Bisect only: give the ragged capture exactly num_tokens // width slots
+    # instead of clamping to max_bs, so the replay has no graph-padded ghost
+    # rows while the synthetic capture layout stays in place. Only sound when
+    # every verify width equals draft_token_num.
+    SGLANG_TEST_RAGGED_CAPTURE_SLOTS_EXACT = EnvBool(False)
     # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift
     # back to steps>0 starts from a cold draft state (low accept until it recovers).
