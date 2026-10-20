@@ -1419,6 +1419,10 @@ class Envs:
     # spreading the graph tier's leftover tokens over the padding rows (or, with
     # no padding rows, over the last real request).
     SGLANG_TEST_RAGGED_EMPTY_PAD_ROWS = EnvBool(False)
+    # Bisect only: shape the synthetic capture layout like a real replay --
+    # full-width rows followed by empty ones -- instead of splitting the tier
+    # evenly over the capture slots.
+    SGLANG_TEST_RAGGED_CAPTURE_FULL_WIDTH = EnvBool(False)
     # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift
     # back to steps>0 starts from a cold draft state (low accept until it recovers).

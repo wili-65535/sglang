@@ -223,6 +223,14 @@ def build_capture_verify_lens(
             f"capture layout cannot pack num_tokens={num_tokens} into "
             f"{num_slots} rows of at most {num_draft_tokens} tokens"
         )
+    if envs.SGLANG_TEST_RAGGED_CAPTURE_FULL_WIDTH.get():
+        # Replay stages full-width rows and leaves the surplus slots empty, so
+        # capture at that shape: the graph bakes whatever capture shows it.
+        full = num_tokens // num_draft_tokens
+        rest = num_tokens - full * num_draft_tokens
+        lens = [num_draft_tokens] * full + ([rest] if rest else [])
+        return lens + [0] * (num_slots - len(lens))
+
     base = num_tokens // num_slots
     rem = num_tokens - base * num_slots
     return [base + 1] * rem + [base] * (num_slots - rem)

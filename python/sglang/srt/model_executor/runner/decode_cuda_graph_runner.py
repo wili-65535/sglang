@@ -641,11 +641,21 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             num_slots=self._ragged_capture_slots(num_tokens),
             num_draft_tokens=self.captured_req_width,
         )
-        layout = RaggedVerifyLayout.from_verify_lens(
-            verify_lens_cpu=verify_lens_cpu,
-            device=self.device,
-            grid=self.capture_num_tokens,
-        )
+        if min(verify_lens_cpu) < 1:
+            # Empty capture rows mirror the replay shape; they carry no request,
+            # so they skip the layout's per-request validation.
+            layout = RaggedVerifyLayout.from_verify_lens_device(
+                verify_lens=torch.tensor(
+                    verify_lens_cpu, dtype=torch.int32, device=self.device
+                ),
+                graph_num_tokens=num_tokens,
+            )
+        else:
+            layout = RaggedVerifyLayout.from_verify_lens(
+                verify_lens_cpu=verify_lens_cpu,
+                device=self.device,
+                grid=self.capture_num_tokens,
+            )
         self._captured_ragged_layouts[num_tokens] = layout
         return layout
 
