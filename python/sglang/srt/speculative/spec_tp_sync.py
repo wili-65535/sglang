@@ -36,6 +36,7 @@ class SpecTpSyncSite(IntEnum):
     DFLASH_ACCEPT_SAMPLE = 14
     DFLASH_ACCEPT_GREEDY = 15
     DFLASH_TARGET = 16
+    DFLASH_SYNTHETIC_DRAFT = 17
 
     @property
     def slug(self) -> str:
@@ -55,6 +56,7 @@ _RNG = frozenset(
         SpecTpSyncSite.DFLASH_SELECTOR,
         SpecTpSyncSite.DFLASH_ACCEPT_SAMPLE,
         SpecTpSyncSite.DFLASH_TARGET,
+        SpecTpSyncSite.DFLASH_SYNTHETIC_DRAFT,
     }
 )
 

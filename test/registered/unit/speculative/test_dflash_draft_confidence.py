@@ -313,6 +313,26 @@ class TestDflashSyntheticDraft(unittest.TestCase):
             delta=0.03,
         )
 
+    def test_reading_the_realized_rate_does_not_move_the_draw(self):
+        # Every rank seeds the same generator and must consume it in lockstep:
+        # the confidence drives the verify budget, so one extra draw on one
+        # rank ends with the ranks scheduling different windows, which is a
+        # hang rather than a wrong answer.
+        gamma = 4
+        kept = DflashSyntheticDraft(
+            gamma=gamma, target_accept=0.7, device="cpu", seed=9
+        )
+        untouched = DflashSyntheticDraft(
+            gamma=gamma, target_accept=0.7, device="cpu", seed=9
+        )
+        for _ in range(3):
+            self.assertGreater(kept.realized_accept, 0.0)
+
+        _sums_a, confidence_a, lens_a = kept.step(4)
+        _sums_b, confidence_b, lens_b = untouched.step(4)
+        self.assertTrue(torch.equal(confidence_a, confidence_b))
+        self.assertTrue(torch.equal(lens_a, lens_b))
+
     def test_a_fit_over_its_output_returns_the_identity(self):
         gamma, bs = 4, 8
         draft = DflashSyntheticDraft(

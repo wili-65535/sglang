@@ -299,6 +299,12 @@ class DflashSyntheticDraft:
         self._generator = torch.Generator(device=device).manual_seed(int(seed))
         center = self._solve_sharpness(float(target_accept))
         self._sharpness_low, self._sharpness_high = self._span(center)
+        # Measured here, not on demand: every rank seeds the same generator and
+        # must consume it in lockstep, so a draw taken on one rank alone would
+        # desynchronize the confidences and with them the verify budget.
+        self.realized_accept = self._mean_accept_over(
+            self._sharpness_low, self._sharpness_high
+        )
 
     def _span(self, center: float) -> Tuple[float, float]:
         """The sharpness range a step draws from. It has to be a range, not one
@@ -333,10 +339,6 @@ class DflashSyntheticDraft:
             else:
                 high = mid
         return (low + high) / 2
-
-    @property
-    def realized_accept(self) -> float:
-        return self._mean_accept_over(self._sharpness_low, self._sharpness_high)
 
     def step(self, bs: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """One step's ([bs, gamma, grid] partition sums, [bs, gamma] confidence,

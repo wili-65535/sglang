@@ -3193,6 +3193,15 @@ class DFlashWorkerV2(BaseSpecWorker):
             partitions, draft_confidence, synthetic_accept_lens = (
                 self._synthetic_draft.step(bs)
             )
+            # Drawn, not derived, so the ranks agree only as long as their
+            # generators stay in lockstep; the budget reads the confidence, so
+            # a drift here ends in ranks scheduling different verify windows.
+            self._tp_sync.sync(
+                SpecTpSyncSite.DFLASH_SYNTHETIC_DRAFT, draft_confidence
+            )
+            self._tp_sync.sync(
+                SpecTpSyncSite.DFLASH_SYNTHETIC_DRAFT, synthetic_accept_lens
+            )
             self._synthetic_step = synthetic_accept_lens
             if self._sts_collector is not None:
                 self._sts_collector.observe_synthetic_step(
