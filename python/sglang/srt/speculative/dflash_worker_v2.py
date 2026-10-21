@@ -54,6 +54,7 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+from sglang.srt.speculative.dflash_sts import DflashStsCollector
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
@@ -118,6 +119,9 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
+
+# One shard per this many collected verify steps.
+_STS_COLLECT_FLUSH_EVERY: int = 64
 
 _FusedKVMaterializeHelper = None
 
@@ -188,7 +192,7 @@ def draft_confidence_from_head(
     bs: int,
     gamma: int,
     tp_group=None,
-    sts_temperatures: Optional[torch.Tensor] = None,
+    sts_temperatures: Optional[torch.Tensor],
 ) -> Optional[torch.Tensor]:
     """[bs, gamma] confidence for drafted tokens, off a second pass over the
     target head. None when the head's shape rules the derivation out.
@@ -775,6 +779,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._maybe_merge_trained_mask_embedding()
         self._cache_full_embed_weight()
         self._sts_temperatures = self._load_sts_temperatures()
+        self._sts_collector = self._build_sts_collector()
         self._verify_planner = self._build_verify_planner()
         # Shares DSpark's flag: the two workers now share the checker, and our
         # run scripts already export it.
@@ -1118,6 +1123,26 @@ class DFlashWorkerV2(BaseSpecWorker):
                 gamma,
             )
         return temperatures
+
+    def _build_sts_collector(self) -> Optional[DflashStsCollector]:
+        """Sink for the data a later STS fit consumes, or None when collection
+        is off. The runtime never reads back what it writes."""
+        collect_path = envs.SGLANG_DFLASH_STS_COLLECT_PATH.get()
+        if not collect_path:
+            return None
+        if self.model_runner.tp_rank == 0:
+            logger.warning(
+                "DFLASH STS collection is on (SGLANG_DFLASH_STS_COLLECT_PATH=%s); "
+                "every verify step copies its partition sums to host. Shards go "
+                "to %s.<n>.pt, fit them with sglang.benchmark.dflash_sts_fit.",
+                collect_path,
+                collect_path,
+            )
+        return DflashStsCollector(
+            path_stem=collect_path,
+            gamma=int(self.block_size) - 1,
+            flush_every=_STS_COLLECT_FLUSH_EVERY,
+        )
 
     def _build_verify_planner(self) -> Optional[DSparkVerifyPlanner]:
         """Per-request verify budget planner, or None when every step verifies
@@ -3125,7 +3150,16 @@ class DFlashWorkerV2(BaseSpecWorker):
                         bs=bs,
                         gamma=int(self.block_size) - 1,
                         tp_group=get_parallel().tp_group,
+                        sts_temperatures=self._sts_temperatures,
                     )
+
+        if self._sts_collector is not None:
+            self._sts_collector.observe_draft(
+                draft_hidden=draft_logits_output.hidden_states,
+                bs=bs,
+                lm_head=lm_head,
+                tp_group=get_parallel().tp_group,
+            )
 
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
@@ -3313,6 +3347,15 @@ class DFlashWorkerV2(BaseSpecWorker):
             bs=bs,
             verify_lens=None if ragged_layout is None else ragged_layout.verify_lens,
         )
+
+        if self._sts_collector is not None:
+            self._sts_collector.observe_verify(
+                candidates=candidates,
+                target_predict=target_predict,
+                verify_lens=(
+                    None if ragged_layout is None else ragged_layout.verify_lens
+                ),
+            )
 
         if self._debug_commit_prefix and _is_all_greedy(sampling_info):
             check_commit_prefix(

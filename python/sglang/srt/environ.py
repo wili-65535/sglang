@@ -1395,6 +1395,11 @@ class Envs:
     # Debug only: dump the row plan (slots, padding, widths, seq_lens,
     # req_pool_indices) of this many ragged verify graph replays. It host-syncs.
     SGLANG_QSA_DEBUG_RAGGED_ROWS = EnvInt(0)
+    # Collect DFLASH STS calibration data to <path>.<shard>.pt, for
+    # sglang.benchmark.dflash_sts_fit. Only steps that verified the whole
+    # block are recorded, so the correctness labels stay unbiased; run with
+    # SGLANG_RAGGED_VERIFY_MODE=static. Debug only; it host-syncs per step.
+    SGLANG_DFLASH_STS_COLLECT_PATH = EnvStr("")
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")

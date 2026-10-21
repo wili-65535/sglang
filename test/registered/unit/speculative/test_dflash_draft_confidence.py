@@ -17,6 +17,13 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.speculative.dflash_sts import (
+    DflashStsDataRecorder,
+    collect_dflash_partition_sums,
+    dflash_sts_temperature_grid,
+    merge_shard_partition_sums,
+    partition_sums_over_grid,
+)
 from sglang.srt.speculative.dflash_worker_v2 import (
     _DflashDraftSampler,
     _merge_shard_partitions,
@@ -166,6 +173,7 @@ class TestEagerDraftConfidence(unittest.TestCase):
             lm_head=self._head(weight),
             bs=bs,
             gamma=block_size - 1,
+            sts_temperatures=None,
         )
         torch.testing.assert_close(eager, sampler.confidence[:bs])
 
@@ -182,6 +190,7 @@ class TestEagerDraftConfidence(unittest.TestCase):
                 lm_head=self._head(weight, shard),
                 bs=1,
                 gamma=7,
+                sts_temperatures=None,
             )
         )
 
@@ -192,6 +201,7 @@ class TestEagerDraftConfidence(unittest.TestCase):
                 lm_head=SimpleNamespace(weight=None, shard_indices=None),
                 bs=1,
                 gamma=7,
+                sts_temperatures=None,
             )
         )
 
@@ -262,6 +272,124 @@ class TestDflashStsTemperatures(unittest.TestCase):
             partitions=partitions, maxima=maxima, temperatures=self.rows
         )
         torch.testing.assert_close(merged, self._reference(self.rows))
+
+
+class TestDflashStsCollect(unittest.TestCase):
+    """The collect side records enough to re-derive the confidence at any
+    temperature on the grid, which a single number per draft token cannot do:
+    DFLASH's confidence is a softmax over the whole row, not a lone logit."""
+
+    def _head(self, weight, shard=None):
+        return SimpleNamespace(weight=weight, shard_indices=shard)
+
+    def test_the_identity_column_is_the_uncalibrated_runtime_confidence(self):
+        # The fit's "before" baseline is read off this column, so a collector
+        # that drifted from the runtime's definition would silently calibrate
+        # against a confidence nobody reports.
+        torch.manual_seed(11)
+        vocab, hidden, bs, gamma = 96, 8, 3, 7
+        weight = torch.randn(vocab, hidden) * 0.3
+        hidden_states = torch.randn(bs * gamma, hidden)
+        grid = dflash_sts_temperature_grid()
+        identity = int((grid - 1.0).abs().argmin())
+
+        partitions = collect_dflash_partition_sums(
+            hidden_states=hidden_states,
+            lm_head=self._head(weight),
+            grid=grid,
+        )
+        runtime = draft_confidence_from_head(
+            hidden_states=hidden_states,
+            lm_head=self._head(weight),
+            bs=bs,
+            gamma=gamma,
+            sts_temperatures=None,
+        )
+        torch.testing.assert_close(
+            partitions[:, identity].reciprocal().view(bs, gamma), runtime
+        )
+
+    def test_shard_merge_recenters_at_each_grid_temperature(self):
+        # With tp=1 the re-centering is a no-op, so a merge that recentered at
+        # one temperature for the whole grid passes every single-rank test and
+        # skews every column but T=1 once the vocabulary is sharded.
+        torch.manual_seed(12)
+        logits = torch.randn(6, 256) * 4.0
+        grid = dflash_sts_temperature_grid()
+        want, _ = partition_sums_over_grid(logits=logits, grid=grid)
+
+        shards = logits.chunk(4, dim=-1)
+        per_shard = [partition_sums_over_grid(logits=s, grid=grid) for s in shards]
+        got = merge_shard_partition_sums(
+            partitions=torch.stack([p for p, _ in per_shard]),
+            maxima=torch.stack([m for _, m in per_shard]),
+            grid=grid,
+        )
+        torch.testing.assert_close(got, want)
+
+    def test_recorder_writes_the_grid_and_the_correct_prefix_mask(self):
+        # The grid has to travel with the data: a shard read against a
+        # different grid maps every fitted temperature to the wrong column.
+        import tempfile
+
+        grid = torch.tensor([0.5, 1.0, 2.0])
+        with tempfile.TemporaryDirectory() as tmp:
+            stem = f"{tmp}/shard"
+            recorder = DflashStsDataRecorder(path_stem=stem, gamma=3, flush_every=1)
+            recorder.record(
+                partitions=torch.ones(2, 3, 3),
+                num_correct_drafts=torch.tensor([0, 2]),
+                grid=grid,
+            )
+            shard = torch.load(f"{stem}.0.pt", map_location="cpu")
+
+        torch.testing.assert_close(shard["temperature_grid"], grid)
+        torch.testing.assert_close(
+            shard["prefix_mask"], torch.tensor([[0.0, 0.0, 0.0], [1.0, 1.0, 0.0]])
+        )
+
+    def test_fit_picks_the_grid_point_whose_survival_is_calibrated(self):
+        from sglang.benchmark.dflash_sts_fit import fit_dflash_sts_temperatures
+
+        # Half the samples accept and half do not, so the calibrated column is
+        # the one reading exactly 0.5; every other column is off by |p - 0.5|.
+        grid = torch.tensor([0.5, 0.8, 1.0, 1.5, 2.0])
+        probs = torch.tensor([0.2, 0.35, 0.8, 0.5, 0.95])
+        num_samples = 64
+        partitions = probs.reciprocal().view(1, 1, -1).expand(num_samples, 1, 5)
+        prefix_mask = torch.zeros(num_samples, 1)
+        prefix_mask[::2] = 1.0
+
+        result = fit_dflash_sts_temperatures(
+            partitions=partitions.contiguous(),
+            prefix_mask=prefix_mask,
+            grid=grid,
+            num_bins=15,
+        )
+        self.assertEqual(result["temperatures"], [1.5])
+        self.assertAlmostEqual(result["ece_after"][0], 0.0, places=9)
+        # The T=1 column reads 0.8 against a 0.5 outcome rate.
+        self.assertAlmostEqual(result["ece_before"][0], 0.3, places=9)
+
+    def test_fit_refuses_shards_collected_on_different_grids(self):
+        from sglang.benchmark.dflash_sts_fit import load_collected_shards
+
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            for index, grid in enumerate(
+                (torch.tensor([0.5, 1.0]), torch.tensor([0.5, 2.0]))
+            ):
+                torch.save(
+                    {
+                        "partitions": torch.ones(1, 1, 2),
+                        "prefix_mask": torch.ones(1, 1),
+                        "temperature_grid": grid,
+                    },
+                    f"{tmp}/shard.{index}.pt",
+                )
+            with self.assertRaises(ValueError):
+                load_collected_shards(data_glob=f"{tmp}/shard.*.pt")
 
 
 if __name__ == "__main__":
