@@ -1118,8 +1118,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # backend's `ForwardMetadata.out_cache_loc_full_physical` (-> KVWriteLoc.full_loc).
 
     def _capture_bs_list(self) -> list[int]:
+        if not self.ragged_verify_mode:
+            return self.capture_bs
+        bs_min = envs.SGLANG_TEST_RAGGED_CAPTURE_BS_MIN.get()
+        if bs_min:
+            capture_bs = [bs for bs in self.capture_bs if bs >= bs_min]
+            assert capture_bs, f"{bs_min=} leaves nothing of {self.capture_bs=}"
+            return capture_bs
         only = envs.SGLANG_TEST_RAGGED_ONLY_TIER.get()
-        if not self.ragged_verify_mode or not only:
+        if not only:
             return self.capture_bs
         # Bisect only: capturing a single tier also means capturing the single
         # bs that tier lives on, so no other shape touches the shared buffers.

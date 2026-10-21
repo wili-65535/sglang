@@ -1432,6 +1432,9 @@ class Envs:
     # Bisect only: capture a single ragged verify tier; batches of every
     # other tier fall back to the eager path.
     SGLANG_TEST_RAGGED_ONLY_TIER = EnvInt(0)
+    # Bisect only: skip capturing the ragged verify graphs below this batch
+    # size, to tell which smaller tier's capture harms the larger ones.
+    SGLANG_TEST_RAGGED_CAPTURE_BS_MIN = EnvInt(0)
     # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift
     # back to steps>0 starts from a cold draft state (low accept until it recovers).
