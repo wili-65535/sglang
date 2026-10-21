@@ -1142,10 +1142,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         # Reverse so cuda graphs share memory better.
         capture_bs = self._capture_bs_list()
+        order = (
+            list(capture_bs)
+            if envs.SGLANG_TEST_RAGGED_CAPTURE_ASCENDING.get()
+            else list(reversed(capture_bs))
+        )
         capture_range = (
-            tqdm.tqdm(list(reversed(capture_bs)))
-            if get_parallel().tp_rank == 0
-            else reversed(capture_bs)
+            tqdm.tqdm(order) if get_parallel().tp_rank == 0 else iter(order)
         )
         lora_variants = (
             [("lora", True), ("nolora", False)]
