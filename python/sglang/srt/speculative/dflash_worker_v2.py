@@ -123,8 +123,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# One shard per this many collected verify steps.
-_STS_COLLECT_FLUSH_EVERY: int = 64
+# One shard per this many collected verify steps. Low on purpose: a run is
+# usually torn down with a kill, so there is no exit flush, and whatever the
+# buffer still holds is lost -- a run shorter than this writes nothing at all.
+_STS_COLLECT_FLUSH_EVERY: int = 16
 
 _FusedKVMaterializeHelper = None
 
