@@ -1117,6 +1117,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # No pool-side pin to clear: the captured full-physical write loc rides the
         # backend's `ForwardMetadata.out_cache_loc_full_physical` (-> KVWriteLoc.full_loc).
 
+    def _capture_bs_list(self) -> list[int]:
+        only = envs.SGLANG_TEST_RAGGED_ONLY_TIER.get()
+        if not self.ragged_verify_mode or not only:
+            return self.capture_bs
+        # Bisect only: capturing a single tier also means capturing the single
+        # bs that tier lives on, so no other shape touches the shared buffers.
+        only_bs = only // self.captured_req_width
+        assert only_bs in self.capture_bs, f"{only_bs=} not in {self.capture_bs=}"
+        return [only_bs]
+
     def _capture_one_stream(self, stream_idx: Optional[int] = None) -> None:
         avail_mem = get_available_gpu_memory(
             self.model_runner.device,
@@ -1124,10 +1134,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             empty_cache=False,
         )
         # Reverse so cuda graphs share memory better.
+        capture_bs = self._capture_bs_list()
         capture_range = (
-            tqdm.tqdm(list(reversed(self.capture_bs)))
+            tqdm.tqdm(list(reversed(capture_bs)))
             if get_parallel().tp_rank == 0
-            else reversed(self.capture_bs)
+            else reversed(capture_bs)
         )
         lora_variants = (
             [("lora", True), ("nolora", False)]
