@@ -1015,9 +1015,16 @@ def apply_dflash_simulated_acceptance(
     simulate_acc_len: float,
     simulate_acc_method: str,
     simulate_acc_token_mode: str,
+    verify_lens: Optional[torch.Tensor] = None,
     fixed_token_id: int = 100,
 ) -> None:
-    """Forces the DFlash acceptance length (SGLANG_SIMULATE_ACC_LEN benchmark knob)."""
+    """Forces the DFlash acceptance length (SGLANG_SIMULATE_ACC_LEN benchmark knob).
+
+    A trimmed verify window caps the forced length the same way a real accept
+    is capped: past verify_lens the target never ran, and compact scatters
+    those rows back as zeros, whose argmax is token 0. Without the cap the
+    knob commits tokens nothing verified.
+    """
     block_size = candidates.shape[1]
 
     # sample_simulated_acc_len clamps to [1, block_size].
@@ -1027,18 +1034,23 @@ def apply_dflash_simulated_acceptance(
     forced_accept_len = forced_commit_len - 1
 
     accept_len.fill_(forced_accept_len)
-    commit_lens.fill_(forced_commit_len)
+    if verify_lens is not None:
+        cap = verify_lens.to(device=accept_len.device, dtype=accept_len.dtype) - 1
+        accept_len.copy_(torch.minimum(accept_len, cap))
+    commit_lens.copy_(accept_len.to(dtype=commit_lens.dtype) + 1)
 
     if simulate_acc_token_mode != "real-draft-token":
         bonus.fill_(fixed_token_id)
         out_tokens.fill_(fixed_token_id)
         return
 
+    accept_index = accept_len.to(torch.int64).unsqueeze(1)
+    bonus.copy_(target_predict.gather(1, accept_index).squeeze(1).to(dtype=bonus.dtype))
     out_tokens.zero_()
-    if forced_accept_len > 0:
-        out_tokens[:, :forced_accept_len].copy_(candidates[:, 1:forced_commit_len])
-    bonus.copy_(target_predict[:, forced_accept_len].to(dtype=bonus.dtype))
-    out_tokens[:, forced_accept_len].copy_(bonus.to(dtype=out_tokens.dtype))
+    out_tokens[:, :-1].copy_(candidates[:, 1:])
+    positions = torch.arange(block_size, device=out_tokens.device).unsqueeze(0)
+    out_tokens.masked_fill_(positions > accept_index, 0)
+    out_tokens.scatter_(1, accept_index, bonus.to(dtype=out_tokens.dtype).unsqueeze(1))
 
 
 def compute_dflash_sampling_correct_drafts_and_bonus(

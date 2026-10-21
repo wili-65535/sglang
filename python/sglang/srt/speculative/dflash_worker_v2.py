@@ -3392,6 +3392,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 simulate_acc_len=SIMULATE_ACC_LEN,
                 simulate_acc_method=SIMULATE_ACC_METHOD,
                 simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
+                verify_lens=(
+                    None if ragged_layout is None else ragged_layout.verify_lens
+                ),
             )
             # The Triton path may have written new_seq_lens from the real
             # accept_len; recompute it from the forced commit_lens.

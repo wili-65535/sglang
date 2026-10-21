@@ -15,6 +15,7 @@ import unittest
 
 import torch
 
+from sglang.srt.speculative.dflash_utils import apply_dflash_simulated_acceptance
 from sglang.srt.speculative.dflash_worker_v2 import accept_within_verify_lens
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -92,6 +93,79 @@ class TestAcceptWithinVerifyLens(unittest.TestCase):
         self.assertEqual(int(accept_len[0]), 0)
         self.assertEqual(int(commit_lens[0]), 1)
         self.assertEqual(int(bonus[0]), 11)
+
+
+class TestSimulatedAcceptanceWithinVerifyLens(unittest.TestCase):
+    """SGLANG_SIMULATE_ACC_LEN forces the accept length past whatever the
+    target actually agreed with, so the trimmed window has to cap it the same
+    way the real accept is capped."""
+
+    def _apply(self, *, bs, forced, verify_lens):
+        candidates = torch.arange(10, 10 + bs * BLOCK, dtype=torch.int64).view(
+            bs, BLOCK
+        )
+        target_predict = torch.arange(
+            90, 90 + bs * BLOCK, dtype=torch.int64
+        ).view(bs, BLOCK)
+        accept_len = torch.zeros(bs, dtype=torch.int32)
+        commit_lens = torch.zeros(bs, dtype=torch.int32)
+        bonus = torch.zeros(bs, dtype=torch.int64)
+        out_tokens = torch.zeros(bs, BLOCK, dtype=torch.int64)
+        apply_dflash_simulated_acceptance(
+            candidates=candidates,
+            target_predict=target_predict,
+            accept_len=accept_len,
+            commit_lens=commit_lens,
+            bonus=bonus,
+            out_tokens=out_tokens,
+            simulate_acc_len=float(forced),
+            simulate_acc_method="match-expected",
+            simulate_acc_token_mode="real-draft-token",
+            verify_lens=(
+                None
+                if verify_lens is None
+                else torch.tensor(verify_lens, dtype=torch.int32)
+            ),
+        )
+        return accept_len, commit_lens, bonus, out_tokens, candidates, target_predict
+
+    def test_the_forced_length_is_capped_per_request(self):
+        # Beyond verify_lens the target never ran; compact scatters those rows
+        # back as zeros, whose argmax is token 0, so an uncapped force commits
+        # a token nothing verified.
+        accept_len, commit_lens, bonus, out_tokens, candidates, target = self._apply(
+            bs=3, forced=6, verify_lens=[8, 3, 5]
+        )
+        self.assertEqual(accept_len.tolist(), [5, 2, 4])
+        self.assertEqual(commit_lens.tolist(), [6, 3, 5])
+        # Each request's bonus is the target prediction at its own boundary.
+        for i, k in enumerate(accept_len.tolist()):
+            self.assertEqual(int(bonus[i]), int(target[i, k]))
+            self.assertEqual(int(out_tokens[i, k]), int(target[i, k]))
+            self.assertEqual(
+                out_tokens[i, :k].tolist(), candidates[i, 1 : k + 1].tolist()
+            )
+            self.assertEqual(out_tokens[i, k + 1 :].tolist(), [0] * (BLOCK - k - 1))
+
+    def test_an_untrimmed_window_keeps_the_uniform_behavior(self):
+        # The benchmark knob's existing use passes no window; that path must
+        # stay exactly what it was, or every published simulated number moves.
+        for verify_lens in (None, [BLOCK] * 2):
+            with self.subTest(verify_lens=verify_lens):
+                (
+                    accept_len,
+                    commit_lens,
+                    bonus,
+                    out_tokens,
+                    candidates,
+                    target,
+                ) = self._apply(bs=2, forced=4, verify_lens=verify_lens)
+                self.assertEqual(accept_len.tolist(), [3, 3])
+                self.assertEqual(commit_lens.tolist(), [4, 4])
+                want = torch.zeros(2, BLOCK, dtype=torch.int64)
+                want[:, :3] = candidates[:, 1:4]
+                want[:, 3] = target[:, 3]
+                self.assertTrue(torch.equal(out_tokens, want))
 
 
 if __name__ == "__main__":
