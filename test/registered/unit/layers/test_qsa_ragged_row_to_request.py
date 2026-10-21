@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.layers.attention.qwen_sparse_attn_backend import QwenSparseAttnBackend
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -121,6 +122,54 @@ class TestQsaRaggedVerifyLens(unittest.TestCase):
         # uncapped variant would hand some request the tier's leftover tokens.
         lens = QwenSparseAttnBackend._ragged_verify_lens(self._spec([3, 4]), 4)
         self.assertLessEqual(max(lens.tolist()), 8)
+
+
+class TestQsaGraphMetadataKey(unittest.TestCase):
+    """Bug regression: the captured graph metadata holds views sliced to the
+    captured tier's row count, and ragged verify captures several tiers at one
+    batch size. Keyed by batch size alone, the last captured tier's views served
+    every replay, so a larger tier's graph rebuilt only the first rows and read
+    stale per-row metadata for the rest -- empty reasoning blocks and dropped
+    tokens from the fourth request onwards, with no error anywhere.
+    """
+
+    @staticmethod
+    def _spec(verify_lens):
+        return SimpleNamespace(ragged_verify_layout=_layout(verify_lens))
+
+    def test_tiers_at_one_batch_size_do_not_share_a_key(self):
+        narrow = QwenSparseAttnBackend._graph_metadata_key(
+            ForwardMode.TARGET_VERIFY, 4, self._spec([2, 2, 2, 2])
+        )
+        wide = QwenSparseAttnBackend._graph_metadata_key(
+            ForwardMode.TARGET_VERIFY, 4, self._spec([8, 8, 8, 8])
+        )
+        self.assertNotEqual(narrow, wide)
+
+    def test_uniform_verify_keys_on_the_batch_size_alone(self):
+        # No ragged layout means one graph per bs, so the key must not start
+        # varying with whatever a caller leaves in spec_info.
+        spec = SimpleNamespace(ragged_verify_layout=None)
+        self.assertEqual(
+            QwenSparseAttnBackend._graph_metadata_key(
+                ForwardMode.TARGET_VERIFY, 4, spec
+            ),
+            QwenSparseAttnBackend._graph_metadata_key(
+                ForwardMode.TARGET_VERIFY, 4, SimpleNamespace(ragged_verify_layout=None)
+            ),
+        )
+
+    def test_decode_ignores_a_stale_verify_layout(self):
+        # Decode rows are per request, so a layout left on spec_info from the
+        # previous verify step must not split the decode graph's metadata.
+        self.assertEqual(
+            QwenSparseAttnBackend._graph_metadata_key(
+                ForwardMode.DECODE, 4, self._spec([8, 8, 8, 8])
+            ),
+            QwenSparseAttnBackend._graph_metadata_key(
+                ForwardMode.DECODE, 4, self._spec([2, 2, 2, 2])
+            ),
+        )
 
 
 if __name__ == "__main__":
