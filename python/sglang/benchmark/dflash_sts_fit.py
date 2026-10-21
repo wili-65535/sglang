@@ -47,8 +47,13 @@ def fit_dflash_sts_temperatures(
     probs = partitions.reciprocal()
     # The uncalibrated confidence is the T=1 column; it is what the runtime
     # reports without a table, so it is the only honest "before" baseline.
-    identity_index = min(
-        range(num_grid), key=lambda k: abs(grid_values[k] - 1.0)
+    identity_index = min(range(num_grid), key=lambda k: abs(grid_values[k] - 1.0))
+    # Ties are the common case once the survival has collapsed (every grid
+    # point then scores a perfect ECE against an all-reject label), so the
+    # search visits the grid from the identity outwards and only replaces on a
+    # strict improvement. The arbitrary end of the grid would win otherwise.
+    search_order = sorted(
+        range(num_grid), key=lambda k: (abs(grid_values[k] - 1.0), k)
     )
 
     temperatures: list[float] = []
@@ -66,12 +71,12 @@ def fit_dflash_sts_temperatures(
             )
         )
 
-        best_index = 0
-        best_survival = survival_fitted * probs[:, position, 0]
+        best_index = search_order[0]
+        best_survival = survival_fitted * probs[:, position, best_index]
         best_ece = expected_calibration_error(
             probs=best_survival, targets=position_target, num_bins=num_bins
         )
-        for index in range(1, num_grid):
+        for index in search_order[1:]:
             candidate_survival = survival_fitted * probs[:, position, index]
             candidate_ece = expected_calibration_error(
                 probs=candidate_survival, targets=position_target, num_bins=num_bins

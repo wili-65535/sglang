@@ -371,6 +371,25 @@ class TestDflashStsCollect(unittest.TestCase):
         # The T=1 column reads 0.8 against a 0.5 outcome rate.
         self.assertAlmostEqual(result["ece_before"][0], 0.3, places=9)
 
+    def test_fit_leaves_an_undecidable_position_uncalibrated(self):
+        from sglang.benchmark.dflash_sts_fit import fit_dflash_sts_temperatures
+
+        # A draft that is never right collapses the survival, and from there
+        # every grid point scores a perfect ECE. Breaking that tie toward the
+        # end of the grid would publish a wild temperature fit to nothing.
+        grid = torch.tensor([0.1, 0.5, 1.0, 2.0, 10.0])
+        num_samples = 32
+        partitions = torch.full((num_samples, 2, 5), 1e6)
+        prefix_mask = torch.zeros(num_samples, 2)
+
+        result = fit_dflash_sts_temperatures(
+            partitions=partitions,
+            prefix_mask=prefix_mask,
+            grid=grid,
+            num_bins=15,
+        )
+        self.assertEqual(result["temperatures"], [1.0, 1.0])
+
     def test_fit_refuses_shards_collected_on_different_grids(self):
         from sglang.benchmark.dflash_sts_fit import load_collected_shards
 
