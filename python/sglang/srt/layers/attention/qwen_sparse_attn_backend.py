@@ -209,7 +209,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         self.req_to_token_pool = req_pool
         self.forward_metadata: Optional[QwenSparseAttnMetadata] = None
         self._cuda_graph_metadata: Dict[
-            Tuple[ForwardMode, int], QwenSparseAttnMetadata
+            Tuple[ForwardMode, int, int], QwenSparseAttnMetadata
         ] = {}
         self._cuda_graph_max_tokens = 0
         self._fa2_scratch: Dict[
@@ -350,6 +350,21 @@ class QwenSparseAttnBackend(AttentionBackend):
         if isinstance(values, torch.Tensor):
             return values[:size].detach().cpu().to(torch.int32)
         return torch.tensor(values[:size], dtype=torch.int32)
+
+    @staticmethod
+    def _graph_metadata_key(forward_mode, bs: int, spec_info) -> Tuple:
+        """Cache key for one captured graph's row-sized metadata views.
+
+        Ragged verify captures several token tiers at the same bs, and each
+        tier's views are sliced to its own row count, so bs alone would let
+        the last captured tier's views serve every replay.
+        """
+        layout = (
+            spec_info.ragged_verify_layout
+            if forward_mode.is_target_verify() and spec_info is not None
+            else None
+        )
+        return (forward_mode, bs, 0 if layout is None else layout.graph_num_tokens)
 
     @staticmethod
     def _ragged_verify_lens(spec_info, bs: int):
@@ -961,7 +976,9 @@ class QwenSparseAttnBackend(AttentionBackend):
             fa2_cu_seqlens_k=self._graph_fa2_cu_seqlens_k[: metadata_rows + 1],
             fa2_cu_seqlens_q=self._graph_cu_seqlens_q[: metadata_rows + 1],
         )
-        self._cuda_graph_metadata[(forward_mode, bs)] = metadata
+        self._cuda_graph_metadata[
+            self._graph_metadata_key(forward_mode, bs, spec_info)
+        ] = metadata
         self.forward_metadata = metadata
 
     def _replay_cuda_graph_metadata(
@@ -976,7 +993,9 @@ class QwenSparseAttnBackend(AttentionBackend):
         num_padding: int = 0,
     ) -> None:
         self._require_chain_speculation(forward_mode, spec_info)
-        metadata = self._cuda_graph_metadata[(forward_mode, bs)]
+        metadata = self._cuda_graph_metadata[
+            self._graph_metadata_key(forward_mode, bs, spec_info)
+        ]
         # Compressed addressing is arithmetic over req_to_token; pure reads below.
         if self._can_replay_with_gpu_kernels(metadata, seq_lens):
             self._replay_cuda_graph_metadata_gpu(
