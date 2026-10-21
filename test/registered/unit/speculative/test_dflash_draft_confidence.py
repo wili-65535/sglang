@@ -390,6 +390,55 @@ class TestDflashStsCollect(unittest.TestCase):
         )
         self.assertEqual(result["temperatures"], [1.0, 1.0])
 
+    def test_the_closed_loop_recovers_a_planted_temperature(self):
+        # Walks the whole chain the way a run does -- partition sums in,
+        # several shards out, loader, fit -- against data whose calibrated
+        # temperature is known. A column swapped against the grid, a shard
+        # concatenated on the wrong axis or a survival that forgot to
+        # accumulate all land here and nowhere else.
+        import tempfile
+
+        from sglang.benchmark.dflash_sts_fit import (
+            fit_dflash_sts_temperatures,
+            load_collected_shards,
+            synthesize_dflash_sts_data,
+        )
+
+        planted = [0.5, 0.8, 1.26, 2.0]
+        partitions, prefix_mask, grid = synthesize_dflash_sts_data(
+            num_samples=2000, planted_temperatures=planted, seed=0
+        )
+        nearest = [float(grid[int((grid - t).abs().argmin())]) for t in planted]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            stem = f"{tmp}/sts"
+            recorder = DflashStsDataRecorder(
+                path_stem=stem, gamma=len(planted), flush_every=4
+            )
+            # Several steps per shard and several shards, so a loader that
+            # mixed the order would show up as a worse fit.
+            for start in range(0, 2000, 200):
+                recorder.record(
+                    partitions=partitions[start : start + 200],
+                    num_correct_drafts=prefix_mask[start : start + 200].sum(dim=1),
+                    grid=grid,
+                )
+            recorder.flush()
+            loaded, loaded_mask, loaded_grid = load_collected_shards(
+                data_glob=f"{stem}.*.pt"
+            )
+
+        self.assertEqual(loaded.shape, partitions.shape)
+        torch.testing.assert_close(loaded_grid, grid)
+        result = fit_dflash_sts_temperatures(
+            partitions=loaded, prefix_mask=loaded_mask, grid=loaded_grid
+        )
+        self.assertEqual(result["temperatures"], nearest)
+        for position in range(len(planted)):
+            self.assertLess(
+                result["ece_after"][position], result["ece_before"][position]
+            )
+
     def test_fit_refuses_shards_collected_on_different_grids(self):
         from sglang.benchmark.dflash_sts_fit import load_collected_shards
 

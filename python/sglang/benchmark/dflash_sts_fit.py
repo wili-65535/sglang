@@ -4,11 +4,16 @@ import argparse
 import glob
 import logging
 from pathlib import Path
+from collections.abc import Sequence
 from typing import Optional
 
 import torch
 
 from sglang.benchmark.dspark_sts_fit import expected_calibration_error
+from sglang.srt.speculative.dflash_sts import (
+    dflash_sts_temperature_grid,
+    partition_sums_over_grid,
+)
 from sglang.srt.speculative.dspark_components.dspark_sts import DSparkStsCalibration
 
 logger = logging.getLogger(__name__)
@@ -95,6 +100,91 @@ def fit_dflash_sts_temperatures(
         "ece_before": ece_before,
         "ece_after": ece_after,
     }
+
+
+def synthesize_dflash_sts_data(
+    *,
+    num_samples: int,
+    planted_temperatures: Sequence[float],
+    vocab: int = 2000,
+    sharpness: tuple[float, float] = (6.0, 14.0),
+    seed: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """A self-consistent draft whose calibrated temperature is known.
+
+    Each sample's logits are drawn at a random sharpness, so the confidence
+    varies across samples -- a draft whose every row is equally peaked carries
+    no signal about which temperature is right. Position j is then accepted
+    with exactly the probability the planted temperature assigns it, which
+    makes planted_temperatures the answer the fit has to recover.
+
+    The identification degrades once the survival probability collapses: with
+    few surviving positives left, every temperature scores the same
+    calibration error. Keep the planted acceptance rate realistic.
+    """
+    generator = torch.Generator().manual_seed(seed)
+    grid = dflash_sts_temperature_grid()
+    gamma = len(planted_temperatures)
+    planted_index = [
+        int((grid - temperature).abs().argmin())
+        for temperature in planted_temperatures
+    ]
+
+    partitions = torch.empty(num_samples, gamma, int(grid.numel()))
+    planted_probs = torch.empty(num_samples, gamma)
+    low, high = sharpness
+    for position in range(gamma):
+        scale = low + torch.rand(num_samples, 1, generator=generator) * (high - low)
+        logits = torch.randn(num_samples, vocab, generator=generator) * scale
+        sums, _ = partition_sums_over_grid(logits=logits, grid=grid)
+        partitions[:, position, :] = sums
+        planted_probs[:, position] = sums[:, planted_index[position]].reciprocal()
+
+    alive = torch.ones(num_samples, dtype=torch.bool)
+    prefix_mask = torch.zeros(num_samples, gamma)
+    for position in range(gamma):
+        drawn = torch.rand(num_samples, generator=generator)
+        alive = alive & (drawn < planted_probs[:, position])
+        prefix_mask[:, position] = alive.to(torch.float32)
+
+    return partitions, prefix_mask, grid
+
+
+def self_test(
+    *,
+    num_samples: int,
+    planted_temperatures: Sequence[float],
+    seed: int,
+    num_bins: int,
+) -> None:
+    """Run collect -> fit on synthetic data and print what came back."""
+    partitions, prefix_mask, grid = synthesize_dflash_sts_data(
+        num_samples=num_samples,
+        planted_temperatures=planted_temperatures,
+        seed=seed,
+    )
+    result = fit_dflash_sts_temperatures(
+        partitions=partitions, prefix_mask=prefix_mask, grid=grid, num_bins=num_bins
+    )
+    print(
+        f"Synthetic closed loop over {num_samples} samples "
+        f"(gamma={len(planted_temperatures)}, seed={seed})"
+    )
+    print("pos  planted  nearest  fitted   ratio  accept rate  ece_before  ece_after")
+    rates = prefix_mask.mean(dim=0).tolist()
+    for position, planted in enumerate(planted_temperatures):
+        nearest = float(grid[int((grid - planted).abs().argmin())])
+        fitted = result["temperatures"][position]
+        print(
+            f"{position:>3}  {planted:>7.4f}  {nearest:>7.4f}  {fitted:>6.4f}  "
+            f"{fitted / nearest:>6.3f}  {rates[position]:>11.3f}  "
+            f"{result['ece_before'][position]:>10.4f}  "
+            f"{result['ece_after'][position]:>9.4f}"
+        )
+    print(
+        "  ratio is against the nearest grid point, not the planted value: the "
+        "fit can only return a temperature the grid carries."
+    )
 
 
 def load_collected_shards(
@@ -190,13 +280,13 @@ def main() -> None:
     )
     parser.add_argument(
         "--data-glob",
-        required=True,
+        default=None,
         help="Glob of collected .pt shards, each a dict with [n, gamma, grid] "
         "'partitions', [n, gamma] 'prefix_mask' and [grid] 'temperature_grid'.",
     )
     parser.add_argument(
         "--out",
-        required=True,
+        default=None,
         type=Path,
         help="Output STS calibration JSON path.",
     )
@@ -212,7 +302,41 @@ def main() -> None:
         default=None,
         help="Optional gamma override to validate the shards against.",
     )
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="Skip the shards and run the fit against synthetic data whose "
+        "calibrated temperatures are known, to check the loop end to end.",
+    )
+    parser.add_argument(
+        "--planted",
+        type=float,
+        nargs="+",
+        default=[0.5, 0.8, 1.26, 2.0],
+        help="--self-test only: the temperatures to plant, one per position.",
+    )
+    parser.add_argument(
+        "--num-samples",
+        type=int,
+        default=4000,
+        help="--self-test only: how many synthetic samples to draw.",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=0, help="--self-test only: the draw's seed."
+    )
     args = parser.parse_args()
+
+    if args.self_test:
+        self_test(
+            num_samples=args.num_samples,
+            planted_temperatures=args.planted,
+            seed=args.seed,
+            num_bins=args.num_bins,
+        )
+        return
+
+    if args.data_glob is None or args.out is None:
+        parser.error("--data-glob and --out are required without --self-test.")
 
     fit(
         data_glob=args.data_glob,
