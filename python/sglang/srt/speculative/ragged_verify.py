@@ -178,18 +178,6 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
             PaddedToBucket,
         )
 
-        if envs.SGLANG_TEST_RAGGED_EMPTY_PAD_ROWS.get():
-            # Empty padding rows: the tier's leftover tokens stay unowned, which
-            # is what the verify window builds them as.
-            padded = torch.nn.functional.pad(
-                self.verify_lens.to(torch.int32), (0, padded_bs - self.bs)
-            )
-            return RaggedVerifyLayout._assemble_device(
-                verify_lens=padded,
-                graph_num_tokens=self.graph_num_tokens,
-                cap=cap,
-            )
-
         padded = PaddedToBucket.execute(
             verify_lens=self.verify_lens,
             graph_num_tokens=self.graph_num_tokens,
@@ -223,14 +211,6 @@ def build_capture_verify_lens(
             f"capture layout cannot pack num_tokens={num_tokens} into "
             f"{num_slots} rows of at most {num_draft_tokens} tokens"
         )
-    if envs.SGLANG_TEST_RAGGED_CAPTURE_FULL_WIDTH.get():
-        # Replay stages full-width rows and leaves the surplus slots empty, so
-        # capture at that shape: the graph bakes whatever capture shows it.
-        full = num_tokens // num_draft_tokens
-        rest = num_tokens - full * num_draft_tokens
-        lens = [num_draft_tokens] * full + ([rest] if rest else [])
-        return lens + [0] * (num_slots - len(lens))
-
     base = num_tokens // num_slots
     rem = num_tokens - base * num_slots
     return [base + 1] * rem + [base] * (num_slots - rem)

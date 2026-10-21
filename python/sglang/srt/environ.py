@@ -1392,11 +1392,6 @@ class Envs:
     # is full width -- diff it against the dense window the static path would
     # have built. Debug only; it host-syncs on every verify.
     SGLANG_DFLASH_DEBUG_WINDOW = EnvBool(False)
-    # Bisect only: when every ragged verify width equals draft_token_num, lay
-    # the QSA graph rows out with the uniform-stride mode instead of the ragged
-    # one. The two are value-identical there, so a behavior change under this
-    # flag localizes a fault to the ragged mode's wiring.
-    SGLANG_QSA_DEBUG_UNIFORM_MODE1 = EnvBool(False)
     # Debug only: dump the row plan (slots, padding, widths, seq_lens,
     # req_pool_indices) of this many ragged verify graph replays. It host-syncs.
     SGLANG_QSA_DEBUG_RAGGED_ROWS = EnvInt(0)
@@ -1404,40 +1399,6 @@ class Envs:
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)
-    # Bisect only: take the dense (uniform-stride) branch in the PLE row layout
-    # or in GDN's conv update even when a ragged layout is attached. Only sound
-    # when every verify width equals draft_token_num -- the two are then
-    # value-identical, so a behavior change localizes the fault to that branch.
-    SGLANG_TEST_RAGGED_DENSE_PLE = EnvBool(False)
-    SGLANG_TEST_RAGGED_DENSE_GDN = EnvBool(False)
-    # Bisect only: give the ragged capture exactly num_tokens // width slots
-    # instead of clamping to max_bs, so the replay has no graph-padded ghost
-    # rows while the synthetic capture layout stays in place. Only sound when
-    # every verify width equals draft_token_num.
-    SGLANG_TEST_RAGGED_CAPTURE_SLOTS_EXACT = EnvBool(False)
-    # Bisect only: pad the staged ragged layout with empty rows instead of
-    # spreading the graph tier's leftover tokens over the padding rows (or, with
-    # no padding rows, over the last real request).
-    SGLANG_TEST_RAGGED_EMPTY_PAD_ROWS = EnvBool(False)
-    # Bisect only: shape the synthetic capture layout like a real replay --
-    # full-width rows followed by empty ones -- instead of splitting the tier
-    # evenly over the capture slots.
-    SGLANG_TEST_RAGGED_CAPTURE_FULL_WIDTH = EnvBool(False)
-    # Bisect only: send ragged verify batches whose graph tier is below this
-    # many tokens down the eager path, leaving the larger tiers on the graph.
-    SGLANG_TEST_RAGGED_MIN_GRAPH_TIER = EnvInt(0)
-    # Bisect only: log each ragged verify tier's capture slots and widths, so a
-    # replay-side row plan can be matched against what capture actually baked.
-    SGLANG_TEST_RAGGED_LOG_CAPTURE = EnvBool(False)
-    # Bisect only: capture a single ragged verify tier; batches of every
-    # other tier fall back to the eager path.
-    SGLANG_TEST_RAGGED_ONLY_TIER = EnvInt(0)
-    # Bisect only: skip capturing the ragged verify graphs below this batch
-    # size, to tell which smaller tier's capture harms the larger ones.
-    SGLANG_TEST_RAGGED_CAPTURE_BS_MIN = EnvInt(0)
-    # Bisect only: capture the ragged verify tiers smallest-first, so the
-    # largest tier is the last writer of anything capture leaves behind.
-    SGLANG_TEST_RAGGED_CAPTURE_ASCENDING = EnvBool(False)
     # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift
     # back to steps>0 starts from a cold draft state (low accept until it recovers).

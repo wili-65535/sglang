@@ -192,8 +192,6 @@ def _prepare_ple_batch(
         assert forward_batch.spec_info is not None
         row_width = int(forward_batch.spec_info.draft_token_num)
         ragged_layout = resolve_ragged_verify_layout(forward_batch)
-        if envs.SGLANG_TEST_RAGGED_DENSE_PLE.get():
-            ragged_layout = None
         if ragged_layout is not None:
             # Compact ragged verify gives each row its own budget and packs the
             # rows end to end, so a token's row is a search in qo_indptr rather

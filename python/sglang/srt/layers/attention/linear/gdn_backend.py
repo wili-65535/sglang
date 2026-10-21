@@ -984,8 +984,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if is_target_verify:
             draft_token_num = forward_batch.spec_info.draft_token_num
             ragged_layout = forward_batch.spec_info.ragged_verify_layout
-            if envs.SGLANG_TEST_RAGGED_DENSE_GDN.get():
-                ragged_layout = None
             if ragged_layout is None:
                 batch_size = seq_len // draft_token_num
                 dense_token_indices = None

@@ -544,12 +544,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _build_ragged_verify_token_buckets(self) -> list[int]:
         buckets = sorted({bs * self.captured_req_width for bs in self.capture_bs})
         assert buckets and buckets[0] > 0, f"{buckets=}"
-        only = envs.SGLANG_TEST_RAGGED_ONLY_TIER.get()
-        if only:
-            # Bisect only: one tier captured means no other tier's capture can
-            # leave anything behind in the shared graph buffers.
-            assert only in buckets, f"{only=} not in {buckets=}"
-            return [only]
         return buckets
 
     def _autotune_buffers(self):
@@ -625,11 +619,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return not draft_is_deepseek_v4()
 
     def _ragged_capture_slots(self, num_tokens: int) -> int:
-        if (
-            envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.get()
-            or envs.SGLANG_TEST_RAGGED_CAPTURE_SLOTS_EXACT.get()
-        ):
-            return max(1, num_tokens // self.captured_req_width)
+        if envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.get():
+            return num_tokens // self.captured_req_width
         return min(num_tokens, self.max_bs)
 
     def _capture_ragged_verify_layout(self, num_tokens: int):
@@ -647,29 +638,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             num_slots=self._ragged_capture_slots(num_tokens),
             num_draft_tokens=self.captured_req_width,
         )
-        if min(verify_lens_cpu) < 1:
-            # Empty capture rows mirror the replay shape; they carry no request,
-            # so they skip the layout's per-request validation.
-            layout = RaggedVerifyLayout.from_verify_lens_device(
-                verify_lens=torch.tensor(
-                    verify_lens_cpu, dtype=torch.int32, device=self.device
-                ),
-                graph_num_tokens=num_tokens,
-            )
-        else:
-            layout = RaggedVerifyLayout.from_verify_lens(
-                verify_lens_cpu=verify_lens_cpu,
-                device=self.device,
-                grid=self.capture_num_tokens,
-            )
+        layout = RaggedVerifyLayout.from_verify_lens(
+            verify_lens_cpu=verify_lens_cpu,
+            device=self.device,
+            grid=self.capture_num_tokens,
+        )
         self._captured_ragged_layouts[num_tokens] = layout
-        if envs.SGLANG_TEST_RAGGED_LOG_CAPTURE.get():
-            logger.info(
-                "ragged capture: tier=%d slots=%d widths=%s",
-                num_tokens,
-                len(verify_lens_cpu),
-                verify_lens_cpu,
-            )
         return layout
 
     def _stage_ragged_verify_layout(self, ragged_layout, graph_size_key: int) -> None:
@@ -782,8 +756,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return False
 
         admission_tokens = ragged_layout.graph_num_tokens
-        if admission_tokens < envs.SGLANG_TEST_RAGGED_MIN_GRAPH_TIER.get():
-            return False
         is_tokens_supported = admission_tokens <= self.capture_num_tokens[
             -1
         ] and forward_batch.batch_size <= self._ragged_capture_slots(admission_tokens)
@@ -1117,23 +1089,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # No pool-side pin to clear: the captured full-physical write loc rides the
         # backend's `ForwardMetadata.out_cache_loc_full_physical` (-> KVWriteLoc.full_loc).
 
-    def _capture_bs_list(self) -> list[int]:
-        if not self.ragged_verify_mode:
-            return self.capture_bs
-        bs_min = envs.SGLANG_TEST_RAGGED_CAPTURE_BS_MIN.get()
-        if bs_min:
-            capture_bs = [bs for bs in self.capture_bs if bs >= bs_min]
-            assert capture_bs, f"{bs_min=} leaves nothing of {self.capture_bs=}"
-            return capture_bs
-        only = envs.SGLANG_TEST_RAGGED_ONLY_TIER.get()
-        if not only:
-            return self.capture_bs
-        # Bisect only: capturing a single tier also means capturing the single
-        # bs that tier lives on, so no other shape touches the shared buffers.
-        only_bs = only // self.captured_req_width
-        assert only_bs in self.capture_bs, f"{only_bs=} not in {self.capture_bs=}"
-        return [only_bs]
-
     def _capture_one_stream(self, stream_idx: Optional[int] = None) -> None:
         avail_mem = get_available_gpu_memory(
             self.model_runner.device,
@@ -1141,14 +1096,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             empty_cache=False,
         )
         # Reverse so cuda graphs share memory better.
-        capture_bs = self._capture_bs_list()
-        order = (
-            list(capture_bs)
-            if envs.SGLANG_TEST_RAGGED_CAPTURE_ASCENDING.get()
-            else list(reversed(capture_bs))
-        )
         capture_range = (
-            tqdm.tqdm(order) if get_parallel().tp_rank == 0 else iter(order)
+            tqdm.tqdm(list(reversed(self.capture_bs)))
+            if get_parallel().tp_rank == 0
+            else reversed(self.capture_bs)
         )
         lora_variants = (
             [("lora", True), ("nolora", False)]
