@@ -1142,6 +1142,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             path_stem=collect_path,
             gamma=int(self.block_size) - 1,
             flush_every=_STS_COLLECT_FLUSH_EVERY,
+            is_writer=self.model_runner.tp_rank == 0,
         )
 
     def _build_verify_planner(self) -> Optional[DSparkVerifyPlanner]:
@@ -3159,6 +3160,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 bs=bs,
                 lm_head=lm_head,
                 tp_group=get_parallel().tp_group,
+                runtime_confidence=draft_confidence,
             )
 
         draft_tokens = self._draft_block_tokens_buf[:bs]

@@ -166,17 +166,29 @@ class DflashStsCollector:
     the accept -- so the draft half is held until the accept half lands.
     """
 
-    def __init__(self, *, path_stem: str, gamma: int, flush_every: int) -> None:
+    def __init__(
+        self, *, path_stem: str, gamma: int, flush_every: int, is_writer: bool
+    ) -> None:
         self._gamma = int(gamma)
         self._grid = dflash_sts_temperature_grid()
-        self._recorder = DflashStsDataRecorder(
-            path_stem=path_stem, gamma=int(gamma), flush_every=int(flush_every)
+        # Every rank derives the sums -- the shard merge is a collective, so a
+        # rank that skipped it would hang the others -- but they all hold the
+        # same global values, so only one rank may write them.
+        self._recorder = (
+            DflashStsDataRecorder(
+                path_stem=path_stem, gamma=int(gamma), flush_every=int(flush_every)
+            )
+            if is_writer
+            else None
         )
         self._pending: Optional[torch.Tensor] = None
         self._warned_no_hidden = False
         self._warned_trimmed = False
+        self._warned_drift = False
 
-    def observe_draft(self, *, draft_hidden, bs: int, lm_head, tp_group) -> None:
+    def observe_draft(
+        self, *, draft_hidden, bs: int, lm_head, tp_group, runtime_confidence
+    ) -> None:
         self._pending = None
         if draft_hidden is None:
             if not self._warned_no_hidden:
@@ -196,10 +208,35 @@ class DflashStsCollector:
         )
         if partitions is not None:
             self._pending = partitions.view(int(bs), self._gamma, -1)
+            self._check_identity_column(runtime_confidence)
+
+    def _check_identity_column(self, runtime_confidence) -> None:
+        """The T=1 column must be the confidence the runtime publishes.
+
+        Only a sharded run can tell the two apart: with tp=1 both are one
+        reduction over the same logits, while with tp>1 they are separate
+        merges whose re-centering has to agree.
+        """
+        if runtime_confidence is None or self._warned_drift:
+            return
+        identity = int((self._grid - 1.0).abs().argmin())
+        collected = self._pending[:, :, identity].reciprocal()
+        drift = (collected - runtime_confidence.float()).abs() / collected.clamp_min(
+            1e-12
+        )
+        worst = float(drift.max())
+        if worst > 1e-3:
+            logger.warning(
+                "DFLASH STS collection disagrees with the published confidence "
+                "by %.3e at T=1; the collected partitions and the runtime's "
+                "merge have drifted apart.",
+                worst,
+            )
+            self._warned_drift = True
 
     def observe_verify(self, *, candidates, target_predict, verify_lens) -> None:
         pending, self._pending = self._pending, None
-        if pending is None or target_predict is None:
+        if pending is None or target_predict is None or self._recorder is None:
             return
         if verify_lens is not None:
             # A trimmed window stops the accept early, so the drafts past it

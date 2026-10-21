@@ -18,6 +18,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.speculative.dflash_sts import (
+    DflashStsCollector,
     DflashStsDataRecorder,
     collect_dflash_partition_sums,
     dflash_sts_temperature_grid,
@@ -389,6 +390,46 @@ class TestDflashStsCollect(unittest.TestCase):
             num_bins=15,
         )
         self.assertEqual(result["temperatures"], [1.0, 1.0])
+
+    def test_only_the_writer_rank_lays_down_shards(self):
+        # Every rank has to derive the sums, because the shard merge is a
+        # collective; they then all hold the same values, so a second writer
+        # only races the first for the same filenames.
+        import glob
+        import tempfile
+
+        torch.manual_seed(13)
+        vocab, hidden, bs, block = 64, 8, 2, 8
+        weight = torch.randn(vocab, hidden) * 0.3
+        head = self._head(weight)
+        draft_hidden = torch.randn(bs, block, hidden)
+        candidates = torch.randint(0, vocab, (bs, block))
+
+        written = {}
+        for is_writer in (True, False):
+            with tempfile.TemporaryDirectory() as tmp:
+                collector = DflashStsCollector(
+                    path_stem=f"{tmp}/sts",
+                    gamma=block - 1,
+                    flush_every=1,
+                    is_writer=is_writer,
+                )
+                collector.observe_draft(
+                    draft_hidden=draft_hidden,
+                    bs=bs,
+                    lm_head=head,
+                    tp_group=None,
+                    runtime_confidence=None,
+                )
+                collector.observe_verify(
+                    candidates=candidates,
+                    target_predict=candidates.clone(),
+                    verify_lens=None,
+                )
+                written[is_writer] = len(glob.glob(f"{tmp}/sts.*.pt"))
+
+        self.assertEqual(written[True], 1)
+        self.assertEqual(written[False], 0)
 
     def test_the_closed_loop_recovers_a_planted_temperature(self):
         # Walks the whole chain the way a run does -- partition sums in,
