@@ -16,6 +16,7 @@ import msgspec
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.qsa.config import (
     is_qwen_qsa,
