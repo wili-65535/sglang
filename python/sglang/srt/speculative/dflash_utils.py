@@ -1016,9 +1016,11 @@ def apply_dflash_simulated_acceptance(
     simulate_acc_method: str,
     simulate_acc_token_mode: str,
     verify_lens: Optional[torch.Tensor] = None,
+    forced_accept_lens: Optional[torch.Tensor] = None,
     fixed_token_id: int = 100,
 ) -> None:
-    """Forces the DFlash acceptance length (SGLANG_SIMULATE_ACC_LEN benchmark knob).
+    """Forces the DFlash acceptance length (SGLANG_SIMULATE_ACC_LEN benchmark
+    knob, or a per-request length a synthetic draft drew).
 
     A trimmed verify window caps the forced length the same way a real accept
     is capped: past verify_lens the target never ran, and compact scatters
@@ -1027,13 +1029,16 @@ def apply_dflash_simulated_acceptance(
     """
     block_size = candidates.shape[1]
 
-    # sample_simulated_acc_len clamps to [1, block_size].
-    forced_commit_len = sample_simulated_acc_len(
-        simulate_acc_len, simulate_acc_method, block_size
-    )
-    forced_accept_len = forced_commit_len - 1
-
-    accept_len.fill_(forced_accept_len)
+    if forced_accept_lens is None:
+        # sample_simulated_acc_len clamps to [1, block_size].
+        forced_commit_len = sample_simulated_acc_len(
+            simulate_acc_len, simulate_acc_method, block_size
+        )
+        accept_len.fill_(forced_commit_len - 1)
+    else:
+        accept_len.copy_(
+            forced_accept_lens.to(device=accept_len.device, dtype=accept_len.dtype)
+        )
     if verify_lens is not None:
         cap = verify_lens.to(device=accept_len.device, dtype=accept_len.dtype) - 1
         accept_len.copy_(torch.minimum(accept_len, cap))

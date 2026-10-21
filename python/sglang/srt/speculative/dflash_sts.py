@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import math
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 
@@ -234,6 +234,17 @@ class DflashStsCollector:
             )
             self._warned_drift = True
 
+    def observe_synthetic_step(self, *, partitions, accept_lens) -> None:
+        """Record a step the synthetic draft drove. Its labels come from the
+        draw, not from the target: what the target agreed with says nothing
+        about a draft token this mode invented."""
+        self._pending = None
+        if self._recorder is None:
+            return
+        self._recorder.record(
+            partitions=partitions, num_correct_drafts=accept_lens, grid=self._grid
+        )
+
     def observe_verify(self, *, candidates, target_predict, verify_lens) -> None:
         pending, self._pending = self._pending, None
         if pending is None or target_predict is None or self._recorder is None:
@@ -258,3 +269,100 @@ class DflashStsCollector:
             num_correct_drafts=num_correct_drafts,
             grid=self._grid,
         )
+
+
+class DflashSyntheticDraft:
+    """A stand-in draft whose confidence is calibrated at T=1 by construction.
+
+    An untrained draft collects nothing a temperature can be fit to: it is
+    never right, so every label is a reject, and its output is flat, so every
+    confidence is 1/vocab. This replaces both halves with a draw that agrees
+    with itself -- the confidence comes from synthetic logits, and a draft
+    token is accepted with exactly that probability -- which makes 1.0 the
+    answer a fit over the collected data has to return.
+
+    The logits are drawn over a small synthetic vocabulary rather than the
+    model's: nothing here touches the real head, and the partition sum's cost
+    is linear in the vocabulary.
+    """
+
+    _VOCAB: int = 2048
+    _SHARPNESS_SPAN: float = 8.0
+
+    def __init__(
+        self, *, gamma: int, target_accept: float, device, seed: int = 0
+    ) -> None:
+        self._gamma = int(gamma)
+        self._device = device
+        self._grid = dflash_sts_temperature_grid().to(device=device)
+        self._identity = int((self._grid - 1.0).abs().argmin())
+        self._generator = torch.Generator(device=device).manual_seed(int(seed))
+        center = self._solve_sharpness(float(target_accept))
+        self._sharpness_low, self._sharpness_high = self._span(center)
+
+    def _span(self, center: float) -> Tuple[float, float]:
+        """The sharpness range a step draws from. It has to be a range, not one
+        value: a draft whose every row is equally peaked publishes one
+        confidence, and one confidence cannot tell two temperatures apart."""
+        half = self._SHARPNESS_SPAN / 2
+        return max(0.5, center - half), max(0.5, center - half) + self._SHARPNESS_SPAN
+
+    def _mean_accept_over(self, low: float, high: float, rows: int = 512) -> float:
+        sharpness = low + torch.rand(
+            rows, 1, generator=self._generator, device=self._device
+        ) * (high - low)
+        logits = (
+            torch.randn(
+                rows, self._VOCAB, generator=self._generator, device=self._device
+            )
+            * sharpness
+        )
+        sums, _ = partition_sums_over_grid(logits=logits, grid=self._grid)
+        return float(sums[:, self._identity].reciprocal().mean())
+
+    def _solve_sharpness(self, target_accept: float) -> float:
+        """The range center whose mean max-softmax probability is
+        target_accept. Monotone in the center, so a bisection lands it; done
+        once, on the synthetic vocabulary, and the realized rate is reported
+        by the caller because the solve is over a sampled mean."""
+        low, high = 0.5, 60.0
+        for _ in range(24):
+            mid = (low + high) / 2
+            if self._mean_accept_over(*self._span(mid)) < target_accept:
+                low = mid
+            else:
+                high = mid
+        return (low + high) / 2
+
+    @property
+    def realized_accept(self) -> float:
+        return self._mean_accept_over(self._sharpness_low, self._sharpness_high)
+
+    def step(self, bs: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """One step's ([bs, gamma, grid] partition sums, [bs, gamma] confidence,
+        [bs] accepted draft counts)."""
+        rows = int(bs) * self._gamma
+        sharpness = self._sharpness_low + torch.rand(
+            rows, 1, generator=self._generator, device=self._device
+        ) * (self._sharpness_high - self._sharpness_low)
+        logits = (
+            torch.randn(
+                rows, self._VOCAB, generator=self._generator, device=self._device
+            )
+            * sharpness
+        )
+        sums, _ = partition_sums_over_grid(logits=logits, grid=self._grid)
+        confidence = sums[:, self._identity].reciprocal().view(int(bs), self._gamma)
+
+        drawn = torch.rand(
+            int(bs), self._gamma, generator=self._generator, device=self._device
+        )
+        # The chain stops at the first rejected draft, so the accepted count is
+        # the length of the leading run of hits.
+        miss = drawn >= confidence
+        accept_lens = torch.where(
+            miss.any(dim=1),
+            miss.to(torch.int32).argmax(dim=1),
+            torch.full((int(bs),), self._gamma, dtype=torch.int64, device=self._device),
+        ).to(torch.int32)
+        return sums.view(int(bs), self._gamma, -1), confidence, accept_lens

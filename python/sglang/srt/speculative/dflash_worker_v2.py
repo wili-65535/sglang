@@ -54,7 +54,10 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
-from sglang.srt.speculative.dflash_sts import DflashStsCollector
+from sglang.srt.speculative.dflash_sts import (
+    DflashStsCollector,
+    DflashSyntheticDraft,
+)
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
@@ -779,6 +782,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._maybe_merge_trained_mask_embedding()
         self._cache_full_embed_weight()
         self._sts_temperatures = self._load_sts_temperatures()
+        self._synthetic_draft = self._build_synthetic_draft()
+        self._synthetic_step = None
         self._sts_collector = self._build_sts_collector()
         self._verify_planner = self._build_verify_planner()
         # Shares DSpark's flag: the two workers now share the checker, and our
@@ -1144,6 +1149,36 @@ class DFlashWorkerV2(BaseSpecWorker):
             flush_every=_STS_COLLECT_FLUSH_EVERY,
             is_writer=self.model_runner.tp_rank == 0,
         )
+
+    def _build_synthetic_draft(self) -> Optional[DflashSyntheticDraft]:
+        """A stand-in draft whose confidence is calibrated at T=1, or None.
+
+        The committed tokens are meaningless under this knob -- acceptance
+        comes from a draw, not from the target -- so it is for collecting
+        calibration data, never for measuring quality.
+        """
+        target_accept = envs.SGLANG_DFLASH_DEBUG_SYNTHETIC_DRAFT.get()
+        if target_accept < 0:
+            return None
+        if not 0.0 < target_accept < 1.0:
+            raise ValueError(
+                "SGLANG_DFLASH_DEBUG_SYNTHETIC_DRAFT must be in (0, 1), got "
+                f"{target_accept}."
+            )
+        synthetic = DflashSyntheticDraft(
+            gamma=int(self.block_size) - 1,
+            target_accept=target_accept,
+            device=self.device,
+        )
+        if self.model_runner.tp_rank == 0:
+            logger.warning(
+                "DFLASH synthetic draft is on (target accept %.3f, realized "
+                "%.3f); the confidence, the acceptance and every committed "
+                "token come from a draw, not from the model.",
+                target_accept,
+                synthetic.realized_accept,
+            )
+        return synthetic
 
     def _build_verify_planner(self) -> Optional[DSparkVerifyPlanner]:
         """Per-request verify budget planner, or None when every step verifies
@@ -3154,7 +3189,16 @@ class DFlashWorkerV2(BaseSpecWorker):
                         sts_temperatures=self._sts_temperatures,
                     )
 
-        if self._sts_collector is not None:
+        if self._synthetic_draft is not None:
+            partitions, draft_confidence, synthetic_accept_lens = (
+                self._synthetic_draft.step(bs)
+            )
+            self._synthetic_step = synthetic_accept_lens
+            if self._sts_collector is not None:
+                self._sts_collector.observe_synthetic_step(
+                    partitions=partitions, accept_lens=synthetic_accept_lens
+                )
+        elif self._sts_collector is not None:
             self._sts_collector.observe_draft(
                 draft_hidden=draft_logits_output.hidden_states,
                 bs=bs,
@@ -3350,7 +3394,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             verify_lens=None if ragged_layout is None else ragged_layout.verify_lens,
         )
 
-        if self._sts_collector is not None:
+        if self._sts_collector is not None and self._synthetic_draft is None:
             self._sts_collector.observe_verify(
                 candidates=candidates,
                 target_predict=target_predict,
@@ -3371,7 +3415,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 forward_ct=int(batch.forward_iter),
             )
 
-        if SIMULATE_ACC_LEN > 0:
+        if SIMULATE_ACC_LEN > 0 or self._synthetic_draft is not None:
             if SIMULATE_ACC_TOKEN_MODE not in ("fixed", "real-draft-token"):
                 raise ValueError(
                     "Invalid SGLANG_SIMULATE_ACC_TOKEN_MODE "
@@ -3397,7 +3441,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 verify_lens=(
                     None if ragged_layout is None else ragged_layout.verify_lens
                 ),
+                forced_accept_lens=self._synthetic_step,
             )
+            self._synthetic_step = None
             # The Triton path may have written new_seq_lens from the real
             # accept_len; recompute it from the forced commit_lens.
             new_seq_lens = None

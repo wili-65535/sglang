@@ -147,6 +147,35 @@ class TestSimulatedAcceptanceWithinVerifyLens(unittest.TestCase):
             )
             self.assertEqual(out_tokens[i, k + 1 :].tolist(), [0] * (BLOCK - k - 1))
 
+    def test_per_request_forced_lengths_are_honored_and_still_capped(self):
+        # The synthetic draft draws a length per request, not one per step, so
+        # the knob has to carry a tensor through; the window still caps it.
+        candidates = torch.arange(10, 10 + 3 * BLOCK, dtype=torch.int64).view(3, BLOCK)
+        target_predict = torch.arange(90, 90 + 3 * BLOCK, dtype=torch.int64).view(
+            3, BLOCK
+        )
+        accept_len = torch.zeros(3, dtype=torch.int32)
+        commit_lens = torch.zeros(3, dtype=torch.int32)
+        bonus = torch.zeros(3, dtype=torch.int64)
+        out_tokens = torch.zeros(3, BLOCK, dtype=torch.int64)
+        apply_dflash_simulated_acceptance(
+            candidates=candidates,
+            target_predict=target_predict,
+            accept_len=accept_len,
+            commit_lens=commit_lens,
+            bonus=bonus,
+            out_tokens=out_tokens,
+            simulate_acc_len=1.0,
+            simulate_acc_method="match-expected",
+            simulate_acc_token_mode="real-draft-token",
+            verify_lens=torch.tensor([8, 3, 8], dtype=torch.int32),
+            forced_accept_lens=torch.tensor([7, 5, 0], dtype=torch.int32),
+        )
+        # Request 1 is capped to verify_lens - 1; the others keep their draw,
+        # and simulate_acc_len is ignored entirely.
+        self.assertEqual(accept_len.tolist(), [7, 2, 0])
+        self.assertEqual(commit_lens.tolist(), [8, 3, 1])
+
     def test_an_untrimmed_window_keeps_the_uniform_behavior(self):
         # The benchmark knob's existing use passes no window; that path must
         # stay exactly what it was, or every published simulated number moves.

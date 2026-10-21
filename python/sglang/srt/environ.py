@@ -1400,6 +1400,12 @@ class Envs:
     # block are recorded, so the correctness labels stay unbiased; run with
     # SGLANG_RAGGED_VERIFY_MODE=static. Debug only; it host-syncs per step.
     SGLANG_DFLASH_STS_COLLECT_PATH = EnvStr("")
+    # Replace the draft's confidence and its acceptance with a self-consistent
+    # synthetic draw whose mean per-token acceptance is this value, so STS
+    # collection has something to calibrate before the draft has trained
+    # weights. A fit over the collected data must then return T=1. The
+    # committed tokens are meaningless under this knob. Negative = off.
+    SGLANG_DFLASH_DEBUG_SYNTHETIC_DRAFT = EnvFloat(-1.0)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")

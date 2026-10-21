@@ -19,6 +19,7 @@ import torch
 
 from sglang.srt.speculative.dflash_sts import (
     DflashStsCollector,
+    DflashSyntheticDraft,
     DflashStsDataRecorder,
     collect_dflash_partition_sums,
     dflash_sts_temperature_grid,
@@ -34,7 +35,7 @@ from sglang.srt.speculative.dflash_worker_v2 import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 
 def _reference_max_prob(logits: torch.Tensor) -> torch.Tensor:
@@ -273,6 +274,62 @@ class TestDflashStsTemperatures(unittest.TestCase):
             partitions=partitions, maxima=maxima, temperatures=self.rows
         )
         torch.testing.assert_close(merged, self._reference(self.rows))
+
+
+class TestDflashSyntheticDraft(unittest.TestCase):
+    """The stand-in draft exists so STS collection has something to calibrate
+    before the draft has trained weights. Its whole claim is that the
+    confidence it publishes is the probability its acceptance actually
+    realizes, which makes T=1 the answer a fit must return."""
+
+    def _collect(self, *, draft, steps, bs, gamma):
+        partitions, accept_lens = [], []
+        for _ in range(steps):
+            sums, _confidence, lens = draft.step(bs)
+            partitions.append(sums)
+            accept_lens.append(lens)
+        accept = torch.cat(accept_lens)
+        mask = (torch.arange(gamma).view(1, -1) < accept.view(-1, 1)).float()
+        return torch.cat(partitions), mask
+
+    def test_the_acceptance_realizes_the_published_confidence(self):
+        # If the draw and the confidence drift apart -- a different grid
+        # column, a flipped comparison -- the collected data is calibrated to
+        # a temperature nobody can name, and nothing else here would notice.
+        gamma, bs = 4, 8
+        draft = DflashSyntheticDraft(
+            gamma=gamma, target_accept=0.7, device="cpu", seed=3
+        )
+        confidences, hits = [], []
+        # 4800 draws: the gap is a binomial mean, so too few samples fail on a
+        # fair draw rather than on a defect.
+        for _ in range(600):
+            _sums, confidence, accept_lens = draft.step(bs)
+            confidences.append(confidence[:, 0])
+            hits.append((accept_lens > 0).float())
+        self.assertAlmostEqual(
+            float(torch.cat(confidences).mean()),
+            float(torch.cat(hits).mean()),
+            delta=0.03,
+        )
+
+    def test_a_fit_over_its_output_returns_the_identity(self):
+        gamma, bs = 4, 8
+        draft = DflashSyntheticDraft(
+            gamma=gamma, target_accept=0.85, device="cpu", seed=4
+        )
+        partitions, mask = self._collect(draft=draft, steps=250, bs=bs, gamma=gamma)
+        from sglang.benchmark.dflash_sts_fit import fit_dflash_sts_temperatures
+
+        grid = dflash_sts_temperature_grid()
+        result = fit_dflash_sts_temperatures(
+            partitions=partitions, prefix_mask=mask, grid=grid
+        )
+        # One grid step is a factor of 1.122; neighbouring temperatures are not
+        # separable by a binned calibration error on a finite sample.
+        for position, temperature in enumerate(result["temperatures"]):
+            with self.subTest(position=position):
+                self.assertLess(abs(torch.tensor(temperature).log()), 0.13)
 
 
 class TestDflashStsCollect(unittest.TestCase):
