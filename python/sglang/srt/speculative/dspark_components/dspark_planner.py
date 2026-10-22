@@ -141,6 +141,7 @@ class DSparkVerifyPlanner:
         self._dp_tier_gather_enabled = False
         self._is_verify_all = True
         self._uniform_layout_cache: dict = {}
+        self._budget_hook_installed = False
         if self._ragged_verify_mode is not RaggedVerifyMode.STATIC:
             if self._confidence_head is None and not self._external_confidence:
                 raise ValueError(
@@ -346,11 +347,16 @@ class DSparkVerifyPlanner:
         confidence: torch.Tensor,
         prefix_lens: torch.Tensor,
         req_pool_indices: torch.Tensor,
+        req_pool_indices_cpu: Optional[torch.Tensor] = None,
     ) -> Optional[int]:
         del prefix_lens
         if self._budget_planner is None:
             return None
-        req_pool_indices_cpu = req_pool_indices.to("cpu").to(torch.int64)
+        # The batch already carries the host mirror; copying the device tensor
+        # again is a second blocking D2H per step.
+        if req_pool_indices_cpu is None:
+            req_pool_indices_cpu = req_pool_indices.to("cpu")
+        req_pool_indices_cpu = req_pool_indices_cpu.to(torch.int64)
         generation = self.model_runner.req_to_token_pool.req_generation[
             req_pool_indices_cpu
         ].clone()
@@ -369,12 +375,17 @@ class DSparkVerifyPlanner:
         confidence: Optional[torch.Tensor],
         prefix_lens: torch.Tensor,
         req_pool_indices: torch.Tensor,
+        req_pool_indices_cpu: Optional[torch.Tensor] = None,
     ) -> Optional[int]:
-        """Per-step verify-token budget: under overlap it was precomputed into
-        the draft input by prepare_verify_budget; otherwise compute it now."""
+        """Per-step verify-token budget: the scheduler's prepare hook precomputed
+        it into the draft input from the relayed confidence; without that hook
+        compute it now, at the cost of a host sync."""
         if not self.schedules_verify_budget or confidence is None:
             return None
-        if not get_schedule().disable_overlap_schedule:
+        # Keyed on the hook rather than on overlap being on: a worker whose hook
+        # the scheduler never took would read a field nobody filled, and the
+        # budget would silently degenerate to verify-all.
+        if self._budget_hook_installed:
             return draft_input.verify_token_budget
 
         # No collective: the budget derives only from the broadcast draft tokens
@@ -383,12 +394,14 @@ class DSparkVerifyPlanner:
             confidence=confidence,
             prefix_lens=prefix_lens,
             req_pool_indices=req_pool_indices,
+            req_pool_indices_cpu=req_pool_indices_cpu,
         )
         return draft_input.verify_token_budget
 
     def confidence_budget_prepare(self):
         if not self.schedules_verify_budget:
             return None
+        self._budget_hook_installed = True
         return self.prepare_verify_budget
 
     def _budget_from_resolved(

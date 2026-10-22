@@ -1228,7 +1228,28 @@ class DFlashWorkerV2(BaseSpecWorker):
             external_confidence=True,
         )
 
-    def _resolve_ragged_layout(self, *, batch, draft_confidence, prefix_lens, device):
+    def get_confidence_budget_prepare(self):
+        """The scheduler's pre-forward hook that resolves this step's verify
+        budget from the relayed confidence, or None when nothing schedules one."""
+        if self._verify_planner is None:
+            return None
+        return self._verify_planner.confidence_budget_prepare()
+
+    def _budget_confidence(
+        self, draft_confidence: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        """The confidence the budget is scheduled from, debug override applied.
+
+        Applied once, before the relay publishes it: the override has to reach
+        the next step's budget too, or the knob only moves half the path.
+        """
+        if draft_confidence is None or self._debug_confidence < 0:
+            return draft_confidence
+        return torch.full_like(draft_confidence, float(self._debug_confidence))
+
+    def _resolve_ragged_layout(
+        self, *, batch, draft_input, draft_confidence, prefix_lens, device
+    ):
         """This step's per-request verify lengths, or None to verify the whole
         block for everyone.
 
@@ -1238,22 +1259,18 @@ class DFlashWorkerV2(BaseSpecWorker):
         """
         if self._verify_planner is None or draft_confidence is None:
             return None
-        if self._debug_confidence >= 0:
-            draft_confidence = torch.full_like(
-                draft_confidence, float(self._debug_confidence)
-            )
         if not _is_all_greedy(batch.sampling_info):
             self._verify_planner.note_non_decode_step()
             return None
-        # Computed here rather than through resolve_verify_token_budget: that
-        # one reads a field the scheduler fills ahead of the step via DSpark's
-        # prepare hook, which DFLASH does not register, so under overlap it
-        # would come back unset and the budget would silently be verify-all.
-        # The cost is a host sync on the confidence every step.
-        budget = self._verify_planner.compute_budget_sync(
+        # Under overlap the scheduler's prepare hook already resolved this from
+        # the relayed confidence, off the step's critical path; without the hook
+        # this falls back to a host sync on the confidence.
+        budget = self._verify_planner.resolve_verify_token_budget(
+            draft_input=draft_input,
             confidence=draft_confidence,
             prefix_lens=prefix_lens,
             req_pool_indices=batch.req_pool_indices,
+            req_pool_indices_cpu=batch.req_pool_indices_cpu,
         )
         return self._verify_planner.schedule_layout(
             req_pool_indices=batch.req_pool_indices,
@@ -3225,9 +3242,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         # --- 1b) Per-request verify budget.
         # The draft always proposed the whole block; the budget only decides how
         # much of it the target verifies this step.
+        budget_confidence = self._budget_confidence(draft_confidence)
         ragged_layout = self._resolve_ragged_layout(
             batch=batch,
-            draft_confidence=draft_confidence,
+            draft_input=draft_input,
+            draft_confidence=budget_confidence,
             prefix_lens=prefix_lens,
             device=device,
         )
@@ -3481,7 +3500,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         if new_seq_lens is None:
             new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
         if on_publish is not None:
-            on_publish(new_seq_lens)
+            # Relayed for the next step's budget; the relay drops it when the
+            # scheduler did not ask for one.
+            on_publish(new_seq_lens, confidence=budget_confidence)
 
         # --- 3) Materialize committed verify-input tokens into draft KV cache.
         hidden = logits_output.hidden_states
