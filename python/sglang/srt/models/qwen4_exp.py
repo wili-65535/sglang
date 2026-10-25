@@ -1,6 +1,8 @@
 """Inference-only Qwen4-Exp (text + VL) on the Qwen3.5 backbone."""
 
+import json
 import math
+import os
 from contextlib import nullcontext
 from typing import Any, Iterable, Optional, Set, Tuple, Union
 
@@ -348,6 +350,58 @@ def _prepare_ple_batch(
         ngram_context=ngram_context,
         ngram_eos_token_id=ngram_eos_token_id,
     )
+
+
+class _LayerDump:
+    """Per-layer hidden-state fingerprints for one forward, keyed by position.
+
+    Fingerprint is the row's fp32 norm plus its first eight elements: enough to
+    tell two activations apart, small enough to keep every layer of every step.
+    """
+
+    def __init__(self, path: str, positions: torch.Tensor, mode: str):
+        self.path = path
+        self.positions = positions.detach().to("cpu", torch.int64).tolist()
+        self.mode = mode
+        self.rows = []
+
+    @classmethod
+    def begin(cls, forward_batch: ForwardBatch) -> Optional["_LayerDump"]:
+        path = envs.SGLANG_QWEN4_DEBUG_LAYER_DUMP.get()
+        if not path:
+            return None
+        positions = forward_batch.positions
+        if positions is None:
+            return None
+        if positions.ndim == 2:
+            positions = positions[0]
+        # One file per rank: the ranks share the path and would interleave lines.
+        return cls(
+            f"{path}.{os.getpid()}", positions.flatten(), str(forward_batch.forward_mode)
+        )
+
+    def record(self, layer_id: int, hidden: torch.Tensor, residual) -> None:
+        x = hidden if residual is None else hidden + residual
+        x = x.reshape(-1, x.shape[-1])[: len(self.positions)].float()
+        self.rows.append(
+            (layer_id, x.norm(dim=-1).cpu().tolist(), x[:, :8].cpu().tolist())
+        )
+
+    def flush(self) -> None:
+        with open(self.path, "a") as f:
+            for layer_id, norms, head in self.rows:
+                f.write(
+                    json.dumps(
+                        {
+                            "mode": self.mode,
+                            "layer": layer_id,
+                            "positions": self.positions,
+                            "norms": norms,
+                            "head": head,
+                        }
+                    )
+                    + "\n"
+                )
 
 
 def _commit_ple_batch(batch: Optional[_PLEBatch], forward_batch: ForwardBatch) -> None:
@@ -1807,6 +1861,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             else None
         )
         aux_hidden_states = AuxHiddenStateList()
+        layer_dump = _LayerDump.begin(forward_batch)
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             if i + 1 < self.end_layer:
@@ -1826,6 +1881,11 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                         else None
                     ),
                 )
+            if layer_dump is not None:
+                layer_dump.record(i, hidden_states, residual)
+
+        if layer_dump is not None:
+            layer_dump.flush()
 
         _commit_ple_batch(ple_batch, forward_batch)
 

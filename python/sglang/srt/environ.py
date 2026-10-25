@@ -1395,6 +1395,11 @@ class Envs:
     # Debug only: dump the row plan (slots, padding, widths, seq_lens,
     # req_pool_indices) of this many ragged verify graph replays. It host-syncs.
     SGLANG_QSA_DEBUG_RAGGED_ROWS = EnvInt(0)
+    # Dump a per-layer fingerprint of Qwen4-Exp's hidden states to <path>.pt,
+    # for both the verify forwards and a prefill replay of what they produced,
+    # so the first layer where the two disagree names the component. Debug
+    # only; it host-syncs per layer and the file grows with every forward.
+    SGLANG_QWEN4_DEBUG_LAYER_DUMP = EnvStr("")
     # Collect DFLASH STS calibration data to <path>.<shard>.pt, for
     # sglang.benchmark.dflash_sts_fit. Only steps that verified the whole
     # block are recorded, so the correctness labels stay unbiased; run with
