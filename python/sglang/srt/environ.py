@@ -1406,6 +1406,11 @@ class Envs:
     # weights. A fit over the collected data must then return T=1. The
     # committed tokens are meaningless under this knob. Negative = off.
     SGLANG_DFLASH_DEBUG_SYNTHETIC_DRAFT = EnvFloat(-1.0)
+    # Check the PLE N-gram history the verify step committed against the one
+    # the committed block tokens imply, and log the first mismatching rows.
+    # The history is n - 1 tokens wide, so a commit of 2 or more determines it
+    # from the block alone. Debug only; it host-syncs per step.
+    SGLANG_PLE_DEBUG_VERIFY_HISTORY = EnvBool(False)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")

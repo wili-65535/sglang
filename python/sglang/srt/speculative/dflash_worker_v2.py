@@ -492,6 +492,52 @@ def _is_all_greedy(sampling_info) -> bool:
     return sampling_info is None or sampling_info.is_all_greedy
 
 
+def check_ple_verify_history(
+    *,
+    draft_tokens: torch.Tensor,
+    commit_lens: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    req_to_token_pool,
+    forward_ct: int,
+) -> None:
+    """Log where the committed PLE N-gram history disagrees with the block.
+
+    The history is n - 1 tokens wide and ends at the last committed block row,
+    so a commit of at least that width is determined by the block alone -- no
+    pre-step history needed. Shorter commits still reach back before the block
+    and are skipped rather than guessed at.
+    """
+    ngram_pool = req_to_token_pool.ngram_pool
+    if not ngram_pool.enabled:
+        return
+    indices = req_pool_indices.to(torch.int64)
+    history = req_to_token_pool.get_ngram_context(indices)
+    width = history.shape[1]
+    commit = commit_lens.to(torch.int64)
+    determined = commit >= width
+    if not bool(determined.any()):
+        return
+    cols = commit.unsqueeze(1) - width + torch.arange(width, device=commit.device)
+    expect = draft_tokens.gather(1, cols.clamp(min=0))
+    bad = determined.unsqueeze(1) & expect.ne(history.to(expect.dtype))
+    rows = torch.nonzero(bad.any(dim=1)).flatten().tolist()
+    if not rows:
+        return
+    details = [
+        f"req_index={i} commit_len={int(commit[i])} "
+        f"committed={history[i].tolist()} expected={expect[i].tolist()}"
+        for i in rows[:4]
+    ]
+    logger.warning(
+        "PLE verify history disagrees with the committed block at forward_ct=%d: "
+        "%d/%d requests. %s",
+        forward_ct,
+        len(rows),
+        int(determined.sum()),
+        " | ".join(details),
+    )
+
+
 def _selector_lattice(draft_model, pred_hidden, anchor_token_ids):
     # Flattened to [N, H] and viewed back because the radix top-k kernel is 2D.
     bs, num_pred = pred_hidden.shape[0], pred_hidden.shape[1]
@@ -791,6 +837,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         # Shares DSpark's flag: the two workers now share the checker, and our
         # run scripts already export it.
         self._debug_commit_prefix = envs.SGLANG_DSPARK_DEBUG_COMMIT_PREFIX.get()
+        self._debug_ple_history = envs.SGLANG_PLE_DEBUG_VERIFY_HISTORY.get()
         self._debug_confidence = envs.SGLANG_DFLASH_DEBUG_CONFIDENCE.get()
         if self._debug_confidence >= 0 and self.model_runner.tp_rank == 0:
             logger.warning(
@@ -3495,6 +3542,15 @@ class DFlashWorkerV2(BaseSpecWorker):
                 seq_lens_pre_verify=seq_lens_pre_verify,
                 seq_lens_post_verify=new_seq_lens,
                 commit_lens=commit_lens,
+            )
+
+        if self._debug_ple_history:
+            check_ple_verify_history(
+                draft_tokens=draft_tokens,
+                commit_lens=commit_lens,
+                req_pool_indices=batch.req_pool_indices,
+                req_to_token_pool=self.model_runner.req_to_token_pool,
+                forward_ct=int(batch.forward_iter),
             )
 
         if new_seq_lens is None:
