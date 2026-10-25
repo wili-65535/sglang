@@ -30,12 +30,16 @@ def _pool(history_rows):
     )
 
 
-def _run(*, blocks, commits, history_rows):
+def _run(*, blocks, commits, history_rows, before=None):
+    n = len(commits)
+    if before is None:
+        before = [[0] * WIDTH for _ in range(n)]
     return check_ple_verify_history(
         draft_tokens=torch.tensor(blocks, dtype=torch.int64),
         commit_lens=torch.tensor(commits, dtype=torch.int32),
-        req_pool_indices=torch.arange(len(commits), dtype=torch.int64),
+        req_pool_indices=torch.arange(n, dtype=torch.int64),
         req_to_token_pool=_pool(history_rows),
+        prev_history=torch.tensor(before, dtype=torch.int64),
         forward_ct=7,
     )
 
@@ -59,12 +63,22 @@ class TestPleVerifyHistory(unittest.TestCase):
             _run(blocks=block, commits=[3], history_rows=[[102, 103]])
         self.assertIn("forward_ct=7", got.output[0])
 
-    def test_commit_shorter_than_the_history_is_skipped(self):
-        # commit 1 leaves the older half of the history from before this block,
-        # which the block cannot supply; guessing it would make noise, not a bug.
+    def test_commit_shorter_than_the_history_reaches_back(self):
+        # commit 1 leaves the older half of the history from before this block;
+        # the pre-step window supplies it, so this case is judged, not skipped.
         block = [[100, 101, 102, 103, 104, 105, 106, 107]]
         with self.assertNoLogs(self.logger, level="WARNING"):
-            _run(blocks=block, commits=[1], history_rows=[[55, 100]])
+            _run(blocks=block, commits=[1], history_rows=[[55, 100]],
+                 before=[[54, 55]])
+
+    def test_a_frozen_history_is_reported(self):
+        # The shape the GPU probe found: the step commits but the stored window
+        # never moves off what the previous step left.
+        block = [[100, 101, 102, 103, 104, 105, 106, 107]]
+        with self.assertLogs(self.logger, level="WARNING") as got:
+            _run(blocks=block, commits=[2], history_rows=[[54, 55]],
+                 before=[[54, 55]])
+        self.assertIn("before=[54, 55]", got.output[0])
 
     def test_one_bad_request_does_not_hide_behind_a_good_one(self):
         blocks = [
@@ -76,7 +90,7 @@ class TestPleVerifyHistory(unittest.TestCase):
         self.assertIn("req_index=1", got.output[0])
         self.assertIn("1/2 requests", got.output[0])
 
-    def test_disabled_pool_is_a_no_op(self):
+    def test_ple_off_is_a_no_op(self):
         pool = SimpleNamespace(ngram_pool=SimpleNamespace(enabled=False))
         with self.assertNoLogs(self.logger, level="WARNING"):
             check_ple_verify_history(
@@ -84,6 +98,7 @@ class TestPleVerifyHistory(unittest.TestCase):
                 commit_lens=torch.tensor([3], dtype=torch.int32),
                 req_pool_indices=torch.zeros(1, dtype=torch.int64),
                 req_to_token_pool=pool,
+                prev_history=None,
                 forward_ct=0,
             )
 

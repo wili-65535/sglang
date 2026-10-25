@@ -492,40 +492,45 @@ def _is_all_greedy(sampling_info) -> bool:
     return sampling_info is None or sampling_info.is_all_greedy
 
 
+def read_ple_history(req_to_token_pool, req_pool_indices: torch.Tensor):
+    """This step's pre-forward PLE N-gram history, or None when PLE is off."""
+    if not req_to_token_pool.ngram_pool.enabled:
+        return None
+    return req_to_token_pool.get_ngram_context(req_pool_indices.to(torch.int64))
+
+
 def check_ple_verify_history(
     *,
     draft_tokens: torch.Tensor,
     commit_lens: torch.Tensor,
     req_pool_indices: torch.Tensor,
     req_to_token_pool,
+    prev_history: Optional[torch.Tensor],
     forward_ct: int,
 ) -> None:
     """Log where the committed PLE N-gram history disagrees with the block.
 
     The history is n - 1 tokens wide and ends at the last committed block row,
-    so a commit of at least that width is determined by the block alone -- no
-    pre-step history needed. Shorter commits still reach back before the block
-    and are skipped rather than guessed at.
+    so sliding the pre-step history along the block by the commit length gives
+    the window the step should have left behind -- the same arithmetic the
+    commit itself does, computed from the two things it cannot get wrong.
     """
-    ngram_pool = req_to_token_pool.ngram_pool
-    if not ngram_pool.enabled:
+    if prev_history is None:
         return
-    indices = req_pool_indices.to(torch.int64)
-    history = req_to_token_pool.get_ngram_context(indices)
+    history = read_ple_history(req_to_token_pool, req_pool_indices)
     width = history.shape[1]
     commit = commit_lens.to(torch.int64)
-    determined = commit >= width
-    if not bool(determined.any()):
-        return
-    cols = commit.unsqueeze(1) - width + torch.arange(width, device=commit.device)
-    expect = draft_tokens.gather(1, cols.clamp(min=0))
-    bad = determined.unsqueeze(1) & expect.ne(history.to(expect.dtype))
+    window = torch.cat([prev_history, draft_tokens.to(prev_history.dtype)], dim=1)
+    cols = commit.unsqueeze(1) + torch.arange(width, device=commit.device)
+    expect = window.gather(1, cols)
+    bad = expect.ne(history)
     rows = torch.nonzero(bad.any(dim=1)).flatten().tolist()
     if not rows:
         return
     details = [
         f"req_index={i} commit_len={int(commit[i])} "
-        f"committed={history[i].tolist()} expected={expect[i].tolist()}"
+        f"before={prev_history[i].tolist()} committed={history[i].tolist()} "
+        f"expected={expect[i].tolist()}"
         for i in rows[:4]
     ]
     logger.warning(
@@ -533,7 +538,7 @@ def check_ple_verify_history(
         "%d/%d requests. %s",
         forward_ct,
         len(rows),
-        int(determined.sum()),
+        int(commit.shape[0]),
         " | ".join(details),
     )
 
@@ -3303,6 +3308,14 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._verify_planner.should_run_compact(layout=ragged_layout)
         )
 
+        # Read before the forward that advances it; the probe below needs the
+        # window this step started from.
+        ple_history_pre_verify = (
+            read_ple_history(self.model_runner.req_to_token_pool, batch.req_pool_indices)
+            if self._debug_ple_history
+            else None
+        )
+
         # Must stay ahead of the target verify launch below.
         grammar_tree = (
             GrammarTree.from_linear_chain(draft_tokens) if batch.has_grammar else None
@@ -3550,6 +3563,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 commit_lens=commit_lens,
                 req_pool_indices=batch.req_pool_indices,
                 req_to_token_pool=self.model_runner.req_to_token_pool,
+                prev_history=ple_history_pre_verify,
                 forward_ct=int(batch.forward_iter),
             )
 
