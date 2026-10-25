@@ -22,10 +22,19 @@ BLOCK = 8
 WIDTH = 2  # ngram_size 3 -> history is 2 tokens
 
 
+# Deliberately not the identity: the N-gram context is addressed by state slot,
+# and a probe that skipped this mapping would read a slot nobody writes.
+SLOT_OF_REQ = [4, 2, 7, 0]
+
+
 def _pool(history_rows):
-    history = torch.tensor(history_rows, dtype=torch.int64)
+    history = torch.zeros((8, WIDTH), dtype=torch.int64)
+    for req, row in enumerate(history_rows):
+        history[SLOT_OF_REQ[req]] = torch.tensor(row, dtype=torch.int64)
+    mapping = torch.tensor(SLOT_OF_REQ + [0] * 4, dtype=torch.int64)
     return SimpleNamespace(
         ngram_pool=SimpleNamespace(enabled=True),
+        get_mamba_indices=lambda indices: mapping[indices],
         get_ngram_context=lambda indices: history[indices],
     )
 
@@ -89,6 +98,14 @@ class TestPleVerifyHistory(unittest.TestCase):
             _run(blocks=blocks, commits=[3, 5], history_rows=[[101, 102], [202, 203]])
         self.assertIn("req_index=1", got.output[0])
         self.assertIn("1/2 requests", got.output[0])
+
+    def test_history_is_read_through_the_state_slot(self):
+        # Reading by request index instead lands on an untouched slot, which
+        # reads back as a history that never moves -- a convincing false alarm.
+        block = [[100, 101, 102, 103, 104, 105, 106, 107]]
+        with self.assertNoLogs(self.logger, level="WARNING"):
+            _run(blocks=block, commits=[2], history_rows=[[100, 101]],
+                 before=[[54, 55]])
 
     def test_ple_off_is_a_no_op(self):
         pool = SimpleNamespace(ngram_pool=SimpleNamespace(enabled=False))

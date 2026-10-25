@@ -493,10 +493,17 @@ def _is_all_greedy(sampling_info) -> bool:
 
 
 def read_ple_history(req_to_token_pool, req_pool_indices: torch.Tensor):
-    """This step's pre-forward PLE N-gram history, or None when PLE is off."""
+    """This step's pre-forward PLE N-gram history, or None when PLE is off.
+
+    The N-gram context is addressed by state slot, not by request pool index --
+    the same mapping _prepare_ple_batch reads it through and the verify commit
+    scatters it back through. Reading it by request index lands on a slot
+    nobody writes, which looks exactly like a frozen history.
+    """
     if not req_to_token_pool.ngram_pool.enabled:
         return None
-    return req_to_token_pool.get_ngram_context(req_pool_indices.to(torch.int64))
+    state_indices = req_to_token_pool.get_mamba_indices(req_pool_indices).long()
+    return req_to_token_pool.get_ngram_context(state_indices)
 
 
 def check_ple_verify_history(
