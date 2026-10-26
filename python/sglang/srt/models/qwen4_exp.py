@@ -375,6 +375,10 @@ class _LayerDump:
             return None
         if positions.ndim == 2:
             positions = positions[0]
+        # The directory may only exist outside the container that runs this.
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         # One file per rank: the ranks share the path and would interleave lines.
         return cls(
             f"{path}.{os.getpid()}", positions.flatten(), str(forward_batch.forward_mode)
@@ -388,6 +392,13 @@ class _LayerDump:
         )
 
     def flush(self) -> None:
+        # A debug dump must not take the scheduler down with it.
+        try:
+            self._write()
+        except OSError as e:
+            logger.warning("Qwen4 layer dump to %s failed: %s", self.path, e)
+
+    def _write(self) -> None:
         with open(self.path, "a") as f:
             for layer_id, norms, head in self.rows:
                 f.write(
