@@ -85,6 +85,12 @@ from sglang.srt.speculative.dspark_components.dspark_commit_check import (
     check_commit_prefix,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import resolve_greedy_mask
+from sglang.srt.speculative.dspark_components.dspark_observability import (
+    DecodeStepObservation,
+    DsparkInfoDumper,
+    InfoComponent,
+    resolve_enabled_components,
+)
 from sglang.srt.speculative.dspark_components.dspark_planner import DSparkVerifyPlanner
 from sglang.srt.speculative.dspark_components.dspark_sts import (
     load_sts_calibration_from_path,
@@ -975,6 +981,35 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._bonus_id_bufs: List[torch.Tensor] = []
         self._out_tokens_bufs: List[torch.Tensor] = []
         self._new_seq_lens_bufs: List[torch.Tensor] = []
+
+        # Per-step records for the SPS cost-table profiler. The table is
+        # consumed by this worker's own budget planner, so it has to be
+        # measured here rather than on the DSPARK worker.
+        info_components = resolve_enabled_components()
+        if InfoComponent.REQS in info_components:
+            raise ValueError(
+                "SGLANG_DSPARK_DEBUG_DUMP=reqs is not supported on the DFLASH "
+                "worker; its per-request fields are DSPARK-specific. Use the "
+                "core / step_cpu_time components."
+            )
+        self._info_dumper = DsparkInfoDumper(
+            components=info_components,
+            gamma=int(self.block_size) - 1,
+            verify_num_draft_tokens=int(self.block_size),
+            attn_tp_rank=get_parallel().attn_tp_rank,
+            device=self.device,
+            mode_value=read_ragged_verify_mode().value,
+        )
+
+    def dump_info_records(self) -> Optional[dict]:
+        dumped = self._info_dumper.dump()
+        if dumped is None:
+            return None
+        dumped["simulate_acc_len"] = SIMULATE_ACC_LEN if SIMULATE_ACC_LEN > 0 else None
+        return dumped
+
+    def clear_info_records(self) -> None:
+        self._info_dumper.clear()
 
     @property
     def draft_worker(self):
@@ -2867,6 +2902,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._validate_phase1_sampling_support(batch)
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            self._info_dumper.note_non_decode_step()
             # Target prefill: capture DFlash aux hidden states for prompt tokens.
             batch_output = self.target_worker.forward_batch_generation(
                 batch,
@@ -2976,6 +3012,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     is_verify=True,
                     skip_attn_backend_init=True,
                 )
+            self._info_dumper.note_non_decode_step()
             empty_ids = torch.empty((0,), dtype=torch.int64, device=self.device)
             empty_lens = torch.empty((0,), dtype=torch.int32, device=self.device)
             next_draft_input = self._make_next_draft_input_decode(
@@ -3002,6 +3039,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         bs = len(batch.seq_lens)
         device = self.device
+        self._info_dumper.begin_step()
 
         # --- 1) Draft a fixed block with the draft model.
         target_model = self.target_worker.model_runner.model
@@ -3657,6 +3695,39 @@ class DFlashWorkerV2(BaseSpecWorker):
             bonus_tokens=bonus,
             new_seq_lens=new_seq_lens,
         )
+
+        if self._info_dumper.enabled:
+            verify_lens = None if ragged_layout is None else ragged_layout.verify_lens
+            num_verify_tokens = (
+                bs * int(self.block_size)
+                if verify_lens is None
+                else int(verify_lens.sum())
+            )
+            self._info_dumper.observe_decode_step(
+                DecodeStepObservation(
+                    forward_ct=int(batch.forward_iter),
+                    bs=bs,
+                    mode=self._info_dumper.mode_value,
+                    budget=None,
+                    lag_steps=None,
+                    num_verify_tokens=num_verify_tokens,
+                    verify_tokens_local=num_verify_tokens,
+                    verify_tokens_dp_synced=num_verify_tokens,
+                    verify_tokens_graph_key=num_verify_tokens,
+                    predicted_step_ms=None,
+                    predicted_theta=None,
+                    verify_lens=verify_lens,
+                    confidence=None,
+                    req_pool_indices=batch.req_pool_indices,
+                    prefix_lens=prefix_lens,
+                    draft_tokens=draft_tokens,
+                    bonus_tokens=bonus,
+                    correct_len=commit_lens,
+                    cap_trim_lens=commit_lens,
+                    commit_lens=commit_lens,
+                    rids=None,
+                )
+            )
 
         return GenerationBatchResult(
             logits_output=logits_output,

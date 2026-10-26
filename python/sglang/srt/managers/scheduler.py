@@ -5286,7 +5286,7 @@ class Scheduler(
         if self.rust_server is not None:
             ret["rust_mm_transport"] = self.rust_server.mm_transport_stats()
 
-        if self.spec_algorithm.is_dspark() and self.draft_worker is not None:
+        if self.spec_algorithm.is_dflash_family() and self.draft_worker is not None:
             info_record = self.draft_worker.dump_info_records()
             if info_record is not None:
                 ret["dspark_info_record"] = info_record
@@ -5342,11 +5342,11 @@ class Scheduler(
                     if_success = False
                     break
             elif k == "dspark_clear_info_records":
-                if not self.spec_algorithm.is_dspark() or not hasattr(
+                if not self.spec_algorithm.is_dflash_family() or not hasattr(
                     self.draft_worker, "clear_info_records"
                 ):
                     logging.warning(
-                        "dspark_clear_info_records requires a DSpark draft worker."
+                        "dspark_clear_info_records requires a DFlash-family draft worker."
                     )
                     if_success = False
                     break
