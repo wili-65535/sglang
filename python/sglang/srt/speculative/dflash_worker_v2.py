@@ -89,6 +89,7 @@ from sglang.srt.speculative.dspark_components.dspark_observability import (
     DecodeStepObservation,
     DsparkInfoDumper,
     InfoComponent,
+    InfoSegment,
     resolve_enabled_components,
 )
 from sglang.srt.speculative.dspark_components.dspark_planner import DSparkVerifyPlanner
@@ -3512,12 +3513,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         if get_parallel().enable_dp_attention and batch.is_extend_in_batch:
             verify_forward_batch.can_run_decode_cuda_graph = False
 
-        target_out = self.target_worker.forward_batch_generation(
-            batch=None,
-            forward_batch=verify_forward_batch,
-            is_verify=True,
-            skip_attn_backend_init=True if not _is_npu else None,
-        )
+        with self._info_dumper.segment(InfoSegment.TARGET_VERIFY):
+            target_out = self.target_worker.forward_batch_generation(
+                batch=None,
+                forward_batch=verify_forward_batch,
+                is_verify=True,
+                skip_attn_backend_init=True if not _is_npu else None,
+            )
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
 
