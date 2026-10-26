@@ -359,14 +359,17 @@ class _LayerDump:
     tell two activations apart, small enough to keep every layer of every step.
     """
 
-    def __init__(self, path: str, positions: torch.Tensor, mode: str):
+    def __init__(self, path: str, positions: torch.Tensor, mode: str, num_layers: int):
         self.path = path
         self.positions = positions.detach().to("cpu", torch.int64).tolist()
         self.mode = mode
+        self.num_layers = num_layers
         self.rows = []
 
     @classmethod
-    def begin(cls, forward_batch: ForwardBatch) -> Optional["_LayerDump"]:
+    def begin(
+        cls, forward_batch: ForwardBatch, num_layers: int
+    ) -> Optional["_LayerDump"]:
         path = envs.SGLANG_QWEN4_DEBUG_LAYER_DUMP.get()
         if not path:
             return None
@@ -389,6 +392,7 @@ class _LayerDump:
             f"{path}.{os.getpid()}",
             positions.flatten(),
             forward_batch.forward_mode.name,
+            num_layers,
         )
 
     def record(self, layer_id: int, hidden: torch.Tensor, residual) -> None:
@@ -412,6 +416,9 @@ class _LayerDump:
                     json.dumps(
                         {
                             "mode": self.mode,
+                            # Target and draft share this class and both start
+                            # at layer 0; without this the two interleave.
+                            "nlayers": self.num_layers,
                             "layer": layer_id,
                             "positions": self.positions,
                             "norms": norms,
@@ -1879,7 +1886,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             else None
         )
         aux_hidden_states = AuxHiddenStateList()
-        layer_dump = _LayerDump.begin(forward_batch)
+        layer_dump = _LayerDump.begin(forward_batch, len(self.layers))
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             if i + 1 < self.end_layer:
