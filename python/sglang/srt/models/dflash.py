@@ -1236,11 +1236,26 @@ class DFlash2DraftModel(DFlashDraftModel):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Top-k base candidates via the target lm_head: hidden [N, H] -> global
         candidate_ids / unary_logits [N, K]."""
+        ids, unary, _, _ = self.compute_candidates_with_partition(hidden)
+        return ids, unary
+
+    def compute_candidates_with_partition(
+        self, hidden: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Also the raw head logits and the full-vocabulary log-partition.
+
+        The lattice runs on transformed logits normalized over K candidates,
+        which answers "best of these K" -- too high to use as a confidence. The
+        raw logit of a candidate against the full-vocabulary lse answers "right
+        out of the whole vocabulary", the same quantity a plain DFLASH draft
+        publishes. candidate_topk computes the lse across the vocab shards, so
+        this stays correct under a sharded lm_head.
+        """
         assert self.lm_head is not None, "draft_model.lm_head unset before capture"
-        ids, vals, _ = candidate_topk(
-            hidden, self.lm_head, self.candidate_selector.top_k
+        ids, vals, lse = candidate_topk(
+            hidden, self.lm_head, self.candidate_selector.top_k, with_partition=True
         )
-        return ids, self._transform_unary_logits(vals)
+        return ids, self._transform_unary_logits(vals), vals, lse
 
 
 class MuseGlimmerAssistantModel(DFlashDraftModel):

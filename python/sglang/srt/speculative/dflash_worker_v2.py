@@ -551,18 +551,49 @@ def check_ple_verify_history(
 
 
 def _selector_lattice(draft_model, pred_hidden, anchor_token_ids):
+    """Lattice plus what the confidence needs: raw head logits and the lse."""
     # Flattened to [N, H] and viewed back because the radix top-k kernel is 2D.
     bs, num_pred = pred_hidden.shape[0], pred_hidden.shape[1]
-    candidate_ids, unary_logits = draft_model.compute_candidates(
-        pred_hidden.reshape(-1, pred_hidden.shape[-1])
+    candidate_ids, unary_logits, raw_logits, lse = (
+        draft_model.compute_candidates_with_partition(
+            pred_hidden.reshape(-1, pred_hidden.shape[-1])
+        )
     )
     candidate_ids = candidate_ids.view(bs, num_pred, -1)
-    return candidate_ids, draft_model.candidate_selector.build_lattice(
+    scores = draft_model.candidate_selector.build_lattice(
         candidate_ids=candidate_ids,
         unary_logits=unary_logits.view(bs, num_pred, -1),
         hidden_states=pred_hidden,
         anchor_token_ids=anchor_token_ids,
     )
+    return (
+        candidate_ids,
+        scores,
+        raw_logits.view(bs, num_pred, -1),
+        lse.view(bs, num_pred),
+    )
+
+
+def selector_draft_confidence(
+    *,
+    candidate_ids: torch.Tensor,
+    raw_logits: torch.Tensor,
+    lse: torch.Tensor,
+    tokens: torch.Tensor,
+) -> torch.Tensor:
+    """Vocabulary softmax probability of each token the selector walked onto.
+
+    The lattice's own scores normalize over the K candidates, so they say "best
+    of these K", not "right out of the vocabulary" -- as a confidence they run
+    systematically high. This is the same quantity a plain DFLASH draft
+    publishes, which keeps the two draft families on one scale.
+
+    The walked token is one of the K candidates, so its column is found by
+    matching ids; top-k ids are distinct, so the match is unique.
+    """
+    idx = (candidate_ids == tokens.unsqueeze(-1)).to(torch.int64).argmax(dim=-1)
+    chosen = raw_logits.gather(-1, idx.unsqueeze(-1)).squeeze(-1)
+    return (chosen.float() - lse.float()).exp()
 
 
 class _SelectorDraftSampler:
@@ -592,6 +623,10 @@ class _SelectorDraftSampler:
         self.q_out = torch.empty(
             (max_bs, gamma, top_k), dtype=torch.float32, device=device
         )
+        # Static like the rest so the budget can read it after a graph replay.
+        self.confidence = torch.empty(
+            (max_bs, gamma), dtype=torch.float32, device=device
+        )
 
     def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
         """Host-side refresh of the static sampling params; must run before the draft
@@ -615,7 +650,9 @@ class _SelectorDraftSampler:
         bs = hidden_states.shape[0] // self.block_size
         block_ids = input_ids.view(bs, self.block_size)
         hs = hidden_states.view(bs, self.block_size, -1)[:, 1:, :]  # pos 0 = anchor
-        candidate_ids, scores = _selector_lattice(self.draft_model, hs, block_ids[:, 0])
+        candidate_ids, scores, raw_logits, lse = _selector_lattice(
+            self.draft_model, hs, block_ids[:, 0]
+        )
         # In-graph philox draw: each replay advances the generator and redraws.
         tokens, q_rows = self.selector.sample_path(
             candidate_ids=candidate_ids,
@@ -627,6 +664,14 @@ class _SelectorDraftSampler:
         self.out[: tokens.numel()].copy_(tokens.reshape(-1))
         self.candidate_out[:bs].copy_(candidate_ids)
         self.q_out[:bs].copy_(q_rows)
+        self.confidence[:bs].copy_(
+            selector_draft_confidence(
+                candidate_ids=candidate_ids,
+                raw_logits=raw_logits,
+                lse=lse,
+                tokens=tokens,
+            )
+        )
 
 
 class _DominoDraftSampler:
@@ -848,6 +893,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._verify_planner = self._build_verify_planner()
         # Shares DSpark's flag: the two workers now share the checker, and our
         # run scripts already export it.
+        self._selector_confidence = None
         self._debug_commit_prefix = envs.SGLANG_DSPARK_DEBUG_COMMIT_PREFIX.get()
         self._debug_ple_history = envs.SGLANG_PLE_DEBUG_VERIFY_HISTORY.get()
         self._debug_confidence = envs.SGLANG_DFLASH_DEBUG_CONFIDENCE.get()
@@ -1253,14 +1299,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         """
         if read_ragged_verify_mode() is RaggedVerifyMode.STATIC:
             return None
+        # The selector draft is no longer on this list: it publishes the same
+        # vocabulary-softmax confidence a plain DFLASH draft does, derived from
+        # the walked candidate's raw head logit against the full-vocabulary lse.
         unsupported = (
-            "selector (DFlash2)"
-            if self.selector is not None
-            else (
-                "lilicorr"
-                if self.lilicorr is not None
-                else "domino" if self._is_domino else None
-            )
+            "lilicorr"
+            if self.lilicorr is not None
+            else "domino" if self._is_domino else None
         )
         if unsupported is not None:
             raise ValueError(
@@ -1970,7 +2015,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         pred_hidden = draft_hidden[:, 1:, :]  # [bs, block_size-1, H]
         num_pred = pred_hidden.shape[1]
 
-        candidate_ids, scores = _selector_lattice(
+        candidate_ids, scores, raw_logits, lse = _selector_lattice(
             draft_model, pred_hidden, anchor_token_ids
         )
         device = pred_hidden.device
@@ -1994,6 +2039,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         if self._selector_sampling_enabled and not _is_all_greedy(sampling_info):
             self._selector_sample = (candidate_ids, q_rows)
+        self._selector_confidence = selector_draft_confidence(
+            candidate_ids=candidate_ids,
+            raw_logits=raw_logits,
+            lse=lse,
+            tokens=tokens,
+        )
         return tokens.view(bs, num_pred)
 
     def _selector_sampling_accept(
@@ -3209,6 +3260,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                     anchor_token_ids=block_ids[:, 0],
                     sampling_info=batch.sampling_info,
                 )
+            if self._verify_planner is not None:
+                draft_confidence = self._selector_confidence
         elif self.lilicorr is not None:
             if (
                 self._lilicorr_sampling_enabled
