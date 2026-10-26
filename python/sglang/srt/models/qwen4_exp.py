@@ -201,17 +201,6 @@ def _prepare_ple_batch(
             # layout still holds: no row exceeds the stride.
             lengths = ragged_layout.verify_lens.long()
             sequence_count = lengths.shape[0]
-            total_verify_tokens = ragged_layout.total_verify_tokens
-            if (
-                total_verify_tokens is not None
-                and processed_tokens > total_verify_tokens
-            ):
-                # Past the layout's coverage an offset would run off its row and
-                # land in the next request's dense slot; refuse instead.
-                raise RuntimeError(
-                    "ragged verify layout does not cover the batch: "
-                    f"{processed_tokens=} {total_verify_tokens=}"
-                )
             query_start_loc = ragged_layout.qo_indptr_device.long()
             req_indices = torch.searchsorted(
                 query_start_loc[1:], positions, right=True
@@ -283,6 +272,12 @@ def _prepare_ple_batch(
             if mode.is_target_verify()
             else None
         )
+        # Under cuda-graph replay the batch is padded to the graph tier while
+        # the staged ragged layout covers only the live tokens, so the tail
+        # offsets run past their row. Validity is already decided above; pull
+        # the index itself back in range for the dense [rows, row_width]
+        # consumers, and route the writes among them to a scratch row.
+        token_offsets = token_offsets.clamp(min=0, max=row_width - 1)
 
     state_indices = (
         get_req_to_token_pool()
@@ -320,13 +315,18 @@ def _prepare_ple_batch(
             # this view is the padded tensor the general path would materialize.
             padded = tokens.unsqueeze(1)
         else:
-            padded = tokens.new_full((sequence_count, row_width), ngram_eos_token_id)
+            padded = tokens.new_full(
+                (sequence_count + 1, row_width), ngram_eos_token_id
+            )
             if processed_tokens:
-                padded[req_indices, token_offsets] = torch.where(
+                scatter_rows = torch.where(valid_tokens, req_indices, sequence_count)
+                scatter_cols = token_offsets.clamp(min=0, max=row_width - 1)
+                padded[scatter_rows, scatter_cols] = torch.where(
                     valid_tokens,
                     tokens,
                     tokens.new_full((), ngram_eos_token_id),
                 )
+            padded = padded[:sequence_count]
         history = get_req_to_token_pool().get_ngram_context(state_indices)
         if history.shape[1] != ngram_size - 1:
             raise RuntimeError(
@@ -1182,10 +1182,15 @@ class Qwen4ExpPLELayer(nn.Module):
             return F.silu(conv_output)
 
         state = conv_state.index_select(0, batch.state_indices).to(dtype=x.dtype)
+        scratch_row = batch.lengths.shape[0]
         padded_seq = x.new_zeros(
-            (batch.lengths.shape[0], batch.row_width, self.conv_channels)
+            (scratch_row + 1, batch.row_width, self.conv_channels)
         )
-        padded_seq[batch.req_indices, batch.token_offsets] = x
+        padded_seq[
+            torch.where(batch.valid_tokens, batch.req_indices, scratch_row),
+            batch.token_offsets,
+        ] = x
+        padded_seq = padded_seq[:scratch_row]
         conv_input = torch.cat([state, padded_seq.transpose(1, 2)], dim=-1)
         conv_output = F.conv1d(
             conv_input,
