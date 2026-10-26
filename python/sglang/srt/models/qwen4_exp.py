@@ -373,6 +373,11 @@ class _LayerDump:
         positions = forward_batch.positions
         if positions is None:
             return None
+        # Copying to host is illegal inside a capture, and a replay never runs
+        # this code at all -- so a graph-backed decode cannot be observed here.
+        # Run the diagnostic with the decode graph disabled.
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            return None
         if positions.ndim == 2:
             positions = positions[0]
         # The directory may only exist outside the container that runs this.
@@ -381,7 +386,9 @@ class _LayerDump:
             os.makedirs(parent, exist_ok=True)
         # One file per rank: the ranks share the path and would interleave lines.
         return cls(
-            f"{path}.{os.getpid()}", positions.flatten(), str(forward_batch.forward_mode)
+            f"{path}.{os.getpid()}",
+            positions.flatten(),
+            forward_batch.forward_mode.name,
         )
 
     def record(self, layer_id: int, hidden: torch.Tensor, residual) -> None:
