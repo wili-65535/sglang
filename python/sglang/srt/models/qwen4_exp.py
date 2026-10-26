@@ -1825,6 +1825,9 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         super().__init__(config, quant_config, prefix, is_nextn)
         self.hc_count = config.hc_count
         self.hidden_size = config.hidden_size
+        # Set from the draft config at capture setup; None means "emit whatever
+        # the layers carry", which is every hc stream.
+        self.dflash_target_feature_width = None
         self.has_ple = any(
             self.layers[layer_id].ple is not None
             for layer_id in range(self.start_layer, self.end_layer)
@@ -1925,8 +1928,39 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         # Always (hidden, hc streams, DFlash captures): an arity that varied by
         # forward mode made callers guess, and the non-idle shape they guessed
         # dropped the captures.
-        captured = aux_hidden_states if len(aux_hidden_states) > 0 else None
+        captured = (
+            self._narrow_dflash_captures(aux_hidden_states)
+            if len(aux_hidden_states) > 0
+            else None
+        )
         return hidden_states, hc_hidden_states, captured
+
+    def set_dflash_target_feature_width(self, width: int) -> None:
+        """Width of one tapped feature the draft's fc was built for."""
+        self.dflash_target_feature_width = int(width)
+
+    def _narrow_dflash_captures(self, captures):
+        """Reduce each tapped feature to the width the draft expects.
+
+        Layers hand each other every hyper-connection stream, so a capture is
+        hc_count * hidden_size wide. A draft trained on the stream mean wants
+        hidden_size back; one trained on the concatenated streams wants all of
+        it. Which one is a property of the draft checkpoint, so it is resolved
+        from the draft config rather than assumed here.
+        """
+        want = self.dflash_target_feature_width
+        have = captures[0].shape[-1]
+        if want is None or want == have:
+            return captures
+        if want * self.hc_count != have:
+            raise ValueError(
+                "DFLASH draft expects a tapped feature of width "
+                f"{want}, but the target captured {have}; that is neither the "
+                f"same width nor hc_count={self.hc_count} streams of it."
+            )
+        return [
+            c.unflatten(-1, (self.hc_count, want)).mean(dim=-2) for c in captures
+        ]
 
 
 class Qwen4ExpVLModel(Qwen4ExpModel):
@@ -1980,6 +2014,9 @@ class Qwen4ExpVLModel(Qwen4ExpModel):
 class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
     hf_to_sglang_mapper = None
+
+    def set_dflash_target_feature_width(self, width: int) -> None:
+        self.model.set_dflash_target_feature_width(width)
 
     @staticmethod
     def shared_experts_fusion_disable_reason(hf_config, quant_config):
