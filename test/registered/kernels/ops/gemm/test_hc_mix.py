@@ -52,7 +52,9 @@ _TOLERANCES = {
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("num_tokens", [1, 4, 7, _FUSED_MIX_MAX_ROWS])
+# 32/33 straddle the padded-row width at which the kernel has to drop to the
+# narrower K tile to fit shared memory.
+@pytest.mark.parametrize("num_tokens", [1, 4, 7, 16, 32, 33, _FUSED_MIX_MAX_ROWS])
 def test_fused_hc_mix_matches_reference(dtype, num_tokens):
     x, w_down, w_up = _make_inputs(num_tokens, dtype)
     assert fused_hc_mix_supported(x, w_down, w_up)
