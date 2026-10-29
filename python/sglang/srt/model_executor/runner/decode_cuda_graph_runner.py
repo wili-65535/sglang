@@ -649,6 +649,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _stage_ragged_verify_layout(self, ragged_layout, graph_size_key: int) -> None:
         # Without this refresh every replay reuses the capture-time synthetic
         # verify_lens / qo_indptr and mis-slices the packed q rows.
+        #
+        # The captured layout is a holder for the two tensors the graph recorded
+        # by address; only their contents are refreshed. Its host fields
+        # (total_verify_tokens, verify_lens_cpu, graph_num_tokens, cap) still
+        # describe the capture and are deliberately not read anywhere -- a
+        # replay's live values reach the backends through the batch's own
+        # spec_info. Do not start reading them off this object.
         cap_layout = self._captured_ragged_layouts.get(graph_size_key)
         if cap_layout is None:
             return
