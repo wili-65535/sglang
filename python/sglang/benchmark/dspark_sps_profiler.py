@@ -172,6 +172,7 @@ def run_profile(
     repeats: int,
     local_tokenizer_path: Optional[str],
     fracs: Optional[list[float]],
+    allow_eager_decode: bool = False,
 ) -> None:
     if get_tokenizer is None:
         raise RuntimeError(
@@ -206,6 +207,7 @@ def run_profile(
         base_url=base_url,
         local_tokenizer_path=local_tokenizer_path,
         allowed_modes=("compact", "cap-accept") if offdiag else ("static",),
+        allow_eager_decode=allow_eager_decode,
     )
     vocab_size = len(get_tokenizer(context.tokenizer_path))
     batch_sizes = sorted(set(batch_sizes))
@@ -349,6 +351,7 @@ def profile_all(
     local_tokenizer_path: Optional[str],
     fracs: Optional[list[float]],
     plot: bool,
+    allow_eager_decode: bool = False,
 ) -> None:
     run_profile(
         base_url=base_url,
@@ -358,6 +361,7 @@ def profile_all(
         repeats=repeats,
         local_tokenizer_path=local_tokenizer_path,
         fracs=fracs,
+        allow_eager_decode=allow_eager_decode,
     )
     fit_profile(
         out=out,
@@ -412,24 +416,36 @@ def fetch_server_context(
     base_url: str,
     local_tokenizer_path: Optional[str],
     allowed_modes: tuple[str, ...] = ("static",),
+    allow_eager_decode: bool = False,
 ) -> ServerContext:
     response = requests.get(base_url + "/server_info", timeout=DEFAULT_TIMEOUT)
     response.raise_for_status()
     info = response.json()
 
     speculative_algorithm = info.get("speculative_algorithm")
-    if speculative_algorithm != "DSPARK":
+    if speculative_algorithm not in ("DSPARK", "DFLASH"):
         raise ValueError(
-            f"Profile against a DSpark server: {base_url} reports "
+            f"Profile against a DFlash-family server: {base_url} reports "
             f"speculative_algorithm={speculative_algorithm!r}. The SPS table is "
-            "measured from real static-mode DSpark verify steps; relaunch with "
-            "--speculative-algorithm DSPARK and SGLANG_RAGGED_VERIFY_MODE=static."
+            "measured from real static-mode verify steps; relaunch with "
+            "--speculative-algorithm DSPARK (or DFLASH) and "
+            "SGLANG_RAGGED_VERIFY_MODE=static."
         )
-    if info.get("disable_cuda_graph"):
+    decode_graph_backend = (
+        (info.get("cuda_graph_config") or {}).get("decode") or {}
+    ).get("backend")
+    eager_decode = bool(info.get("disable_cuda_graph")) or decode_graph_backend in (
+        "disabled",
+        None,
+    )
+    if eager_decode and not allow_eager_decode:
         raise ValueError(
-            "The server runs with --disable-cuda-graph; an SPS table measured "
-            "without cuda graphs is uselessly slow. Relaunch with cuda graphs "
-            "enabled."
+            "The server runs decode eagerly (disable_cuda_graph="
+            f"{info.get('disable_cuda_graph')!r}, decode graph backend="
+            f"{decode_graph_backend!r}); an SPS table measured without cuda "
+            "graphs describes a different step cost than a graph-replaying "
+            "server. Relaunch with decode cuda graphs enabled, or pass "
+            "--allow-eager-decode when the consumer also runs eager."
         )
 
     internal_states = info.get("internal_states") or []
@@ -1466,6 +1482,15 @@ def add_run_args(parser: argparse.ArgumentParser) -> None:
         help="Override the tokenizer path (defaults to the one reported by "
         "/server_info).",
     )
+    parser.add_argument(
+        "--allow-eager-decode",
+        action="store_true",
+        help=(
+            "Profile a server whose decode runs eagerly. The table then "
+            "describes eager steps and is only valid for a consumer that also "
+            "runs eager."
+        ),
+    )
 
 
 def add_fit_args(parser: argparse.ArgumentParser) -> None:
@@ -1549,6 +1574,7 @@ def cli_main() -> None:
             repeats=args.repeats,
             local_tokenizer_path=args.local_tokenizer_path,
             fracs=args.fracs,
+            allow_eager_decode=args.allow_eager_decode,
         )
     elif args.command == "fit":
         fit_profile(
@@ -1569,6 +1595,7 @@ def cli_main() -> None:
             local_tokenizer_path=args.local_tokenizer_path,
             fracs=args.fracs,
             plot=args.plot,
+            allow_eager_decode=args.allow_eager_decode,
         )
 
 

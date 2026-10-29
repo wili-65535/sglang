@@ -213,7 +213,8 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
 
             hc_hidden_states = None
             if isinstance(model_output, tuple):
-                hidden_states, hc_hidden_states = model_output
+                # Third element is the DFlash captures, which MTP has no use for.
+                hidden_states, hc_hidden_states, _ = model_output
             else:
                 hidden_states = model_output
 

@@ -274,6 +274,16 @@ def _case_compact_layout(tc):
             layout=_layout(verify_lens, padded_total),
             device=DEVICE,
         )
+        # Regression: the triton gather used to stride the anchor rows by
+        # gamma, so a wider anchor block fed every request past the first
+        # someone else's token. DFLASH hands over the whole [bs, gamma + 1].
+        tc._parity(
+            dspark_verify_window.CompactVerifyIds,
+            draft_block_ids=_ri(0, VOCAB, (bs, gamma + 1)),
+            draft_tokens=_ri(0, VOCAB, (bs, gamma)),
+            layout=_layout(verify_lens, padded_total),
+            device=DEVICE,
+        )
 
 
 def _case_swa_page_indices(tc):

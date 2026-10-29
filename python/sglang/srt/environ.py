@@ -528,6 +528,9 @@ class Envs:
     # DSpark speculative decoding
     # ===================================================================
     SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER = EnvBool(False)
+    # Check that every committed token equals the target's greedy output at
+    # that position; unlike an output diff it survives a budget-trimmed layout.
+    SGLANG_DSPARK_DEBUG_COMMIT_PREFIX = EnvBool(False)
     SGLANG_DSPARK_DEBUG_CONFIDENCE_METRICS = EnvBool(False)
     SGLANG_DSPARK_DEBUG_DUMP = EnvTuple(tuple())
     SGLANG_DSPARK_LOG_SPS_PRED_INTERVAL = EnvInt(0)
@@ -1378,6 +1381,41 @@ class Envs:
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
+    # Pin every DFLASH draft token's confidence to this value instead of
+    # deriving it from the draft logits. A randomly initialized draft has a
+    # near-uniform output, so its real confidence sits below the planner's
+    # survival_eps and the budget collapses to one row per request; a constant
+    # makes the verify lengths selectable before trained weights exist.
+    # Negative = off (the derived confidence is used).
+    SGLANG_DFLASH_DEBUG_CONFIDENCE = EnvFloat(-1.0)
+    # Log the compact verify window's shape each step, and -- when every row
+    # is full width -- diff it against the dense window the static path would
+    # have built. Debug only; it host-syncs on every verify.
+    SGLANG_DFLASH_DEBUG_WINDOW = EnvBool(False)
+    # Debug only: dump the row plan (slots, padding, widths, seq_lens,
+    # req_pool_indices) of this many ragged verify graph replays. It host-syncs.
+    SGLANG_QSA_DEBUG_RAGGED_ROWS = EnvInt(0)
+    # Dump a per-layer fingerprint of Qwen4-Exp's hidden states to <path>.pt,
+    # for both the verify forwards and a prefill replay of what they produced,
+    # so the first layer where the two disagree names the component. Debug
+    # only; it host-syncs per layer and the file grows with every forward.
+    SGLANG_QWEN4_DEBUG_LAYER_DUMP = EnvStr("")
+    # Collect DFLASH STS calibration data to <path>.<shard>.pt, for
+    # sglang.benchmark.dflash_sts_fit. Only steps that verified the whole
+    # block are recorded, so the correctness labels stay unbiased; run with
+    # SGLANG_RAGGED_VERIFY_MODE=static. Debug only; it host-syncs per step.
+    SGLANG_DFLASH_STS_COLLECT_PATH = EnvStr("")
+    # Replace the draft's confidence and its acceptance with a self-consistent
+    # synthetic draw whose mean per-token acceptance is this value, so STS
+    # collection has something to calibrate before the draft has trained
+    # weights. A fit over the collected data must then return T=1. The
+    # committed tokens are meaningless under this knob. Negative = off.
+    SGLANG_DFLASH_DEBUG_SYNTHETIC_DRAFT = EnvFloat(-1.0)
+    # Check the PLE N-gram history the verify step committed against the one
+    # the committed block tokens imply, and log the first mismatching rows.
+    # The history is n - 1 tokens wide, so a commit of 2 or more determines it
+    # from the block alone. Debug only; it host-syncs per step.
+    SGLANG_PLE_DEBUG_VERIFY_HISTORY = EnvBool(False)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")

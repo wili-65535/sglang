@@ -44,6 +44,7 @@ def configure_aux_hidden_state_capture(
     eagle_aux_hidden_state_layer_ids,
     dflash_use_aux_hidden_state: bool,
     dflash_target_layer_ids,
+    dflash_target_feature_width,
     is_dspark: bool,
 ) -> None:
     """Configure auxiliary hidden state capture for speculative decoding.
@@ -58,6 +59,12 @@ def configure_aux_hidden_state_capture(
             model.set_dspark_layers_to_capture(dflash_target_layer_ids)
         elif hasattr(model, "set_dflash_layers_to_capture"):
             model.set_dflash_layers_to_capture(dflash_target_layer_ids)
+            if dflash_target_feature_width is not None:
+                # Only targets whose layers carry more than one residual stream
+                # have a width to narrow; the rest already emit hidden_size.
+                narrow = getattr(model, "set_dflash_target_feature_width", None)
+                if narrow is not None:
+                    narrow(dflash_target_feature_width)
         else:
             raise ValueError(
                 f"Model {model.__class__.__name__} implements neither "
