@@ -196,6 +196,16 @@ def run_profile(
                     "budget pin runs frac * full verify, so frac <= 1.0 keeps M below "
                     "the full uniform tier and inside the captured cuda graphs."
                 )
+        if settings.temperature != 0.0:
+            raise ValueError(
+                "The off-diagonal sweep needs --temperature 0: a sampled batch "
+                "always verifies the whole window (trimming it needs the target "
+                "argmax the sampling accept paths never materialize), so every "
+                "frac would measure the same full tier while the fit labels it "
+                "with a different batch_tokens. The uniform-tier case is the one "
+                "postprocess_round cannot catch, since it only rejects tiers that "
+                f"differ across steps. Got --temperature {settings.temperature}."
+            )
 
     paths = out_paths(out=out)
     paths["table"].parent.mkdir(parents=True, exist_ok=True)
