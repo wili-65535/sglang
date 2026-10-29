@@ -554,6 +554,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         )
         self._use_strided_target_verify_qkv = False
+        self._ragged_dense_token_indices: Optional[torch.Tensor] = None
 
     def init_forward_metadata_out_graph(
         self,
@@ -590,7 +591,21 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     forward_batch, self.forward_metadata, self.device
                 )
 
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        super().init_forward_metadata_in_graph(forward_batch)
+        # Drop the per-step slot map here rather than in the out-graph hook:
+        # capture_one runs two warmups and the capture pass through one
+        # run_once(), and only this hook runs inside each of them. Resetting
+        # out-graph only would let the capture reuse the warmup's tensor, which
+        # lives outside the graph pool and never refreshes on replay.
+        self._ragged_dense_token_indices = None
+
     def _init_target_verify_qkv_routing(self, forward_batch: ForwardBatch) -> None:
+        # The ragged->dense slot map is a pure function of query_start_loc and
+        # the draft count, so it is the same for every layer in a step; the
+        # first layer of each forward rebuilds it. Replay only runs the
+        # out-graph hook, so clear it here too.
+        self._ragged_dense_token_indices = None
         # CUDA-graph metadata leaves mode and draft count at their defaults.
         if not forward_batch.forward_mode.is_target_verify():
             self._use_strided_target_verify_qkv = False
@@ -993,11 +1008,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 # width; ragged verify packs rows of different widths, so
                 # scatter to the dense layout and gather back after.
                 batch_size = query_start_loc.shape[0] - 1
-                dense_token_indices = ragged_verify_dense_scatter_indices(
-                    query_start_loc=query_start_loc,
-                    seq_len=seq_len,
-                    draft_token_num=draft_token_num,
-                )
+                dense_token_indices = self._ragged_dense_token_indices
+                if dense_token_indices is None:
+                    dense_token_indices = ragged_verify_dense_scatter_indices(
+                        query_start_loc=query_start_loc,
+                        seq_len=seq_len,
+                        draft_token_num=draft_token_num,
+                    )
+                    self._ragged_dense_token_indices = dense_token_indices
                 mixed_qkv_dense = scatter_ragged_to_dense(
                     packed=mixed_qkv,
                     dense_token_indices=dense_token_indices,
