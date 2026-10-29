@@ -479,6 +479,52 @@ def _case_scatter_compact_to_strided(tc):
         )
 
 
+def _case_ragged_dense_round_trip(tc):
+    """gather_strided_to_compact_into must invert scatter_compact_to_strided_into.
+
+    The GDN target-verify path scatters packed rows out to the dense
+    [bs, stride] layout the conv wants and gathers them back, once per layer,
+    off one slot map. Round-tripping is the property that makes that pair safe
+    to reuse a buffer across layers: every covered row comes back bit-exact,
+    and every row past the layout's coverage comes back zero.
+    """
+    torch.manual_seed(37)
+    stride, bs, dim = 8, 5, 256
+    verify_lens = _ri(1, stride + 1, (bs,), torch.int64)
+    covered = int(verify_lens.sum().item())
+    start = torch.cumsum(verify_lens, 0) - verify_lens
+    for packed_rows in (covered, covered + 3):  # exact, and an uncovered tail
+        packed = torch.randn(packed_rows, dim, dtype=torch.bfloat16, device=DEVICE)
+        dense = torch.full(
+            (bs * stride, dim), float("nan"), dtype=torch.bfloat16, device=DEVICE
+        )
+        dspark_verify_window.scatter_compact_to_strided_into(
+            compact=packed,
+            verify_lens=verify_lens,
+            start=start,
+            out=dense,
+            stride=stride,
+            fill_value=0,
+        )
+        # Padding slots are zero, not whatever the buffer held.
+        for i in range(bs):
+            pad = dense[i * stride + int(verify_lens[i]) : (i + 1) * stride]
+            tc.assertTrue(torch.equal(pad, torch.zeros_like(pad)))
+
+        slots = torch.full((packed_rows,), bs * stride, dtype=torch.int64,
+                           device=DEVICE)
+        for i in range(bs):
+            for w in range(int(verify_lens[i])):
+                slots[int(start[i]) + w] = i * stride + w
+        out = torch.full_like(packed, float("nan"))
+        dspark_verify_window.gather_strided_to_compact_into(
+            strided=dense, slot_index=slots, out=out
+        )
+        tc.assertTrue(torch.equal(out[:covered], packed[:covered]))
+        tail = out[covered:]
+        tc.assertTrue(torch.equal(tail, torch.zeros_like(tail)))
+
+
 def _case_schedule_verify_lens_topk(tc):
     torch.manual_seed(20)
     gamma, bs = 5, 64
@@ -537,6 +583,7 @@ _CASES = [
     ("padded_to_bucket", _case_padded_to_bucket),
     ("page_table_positions", _case_page_table_positions),
     ("qo_indptr", _case_qo_indptr),
+    ("ragged_dense_round_trip", _case_ragged_dense_round_trip),
     ("sample_step_tokens", _case_sample_step_tokens),
     ("scatter_compact_to_strided", _case_scatter_compact_to_strided),
     ("schedule_verify_lens_topk", _case_schedule_verify_lens_topk),

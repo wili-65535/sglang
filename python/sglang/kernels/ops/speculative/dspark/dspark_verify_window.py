@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Optional
+
 import msgspec
 import torch
 import triton
@@ -575,12 +577,18 @@ def scatter_compact_to_strided_into(
     out: torch.Tensor,
     stride: int,
     fill_value: float,
+    start: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """`start` is the exclusive prefix sum of `verify_lens`. Pass it when the
+    caller already has it (a query_start_loc prefix, say) to keep the cumsum
+    and the int64 cast off a per-layer path; both tensors are then used as-is.
+    """
     dim = compact.shape[1]
     fill_value = float(fill_value) if out.dtype.is_floating_point else int(fill_value)
-    compact = compact.contiguous()
-    verify_lens = verify_lens.to(dtype=torch.int64).contiguous()
-    start = (torch.cumsum(verify_lens, dim=0) - verify_lens).contiguous()
+    if start is None:
+        compact = compact.contiguous()
+        verify_lens = verify_lens.to(dtype=torch.int64).contiguous()
+        start = (torch.cumsum(verify_lens, dim=0) - verify_lens).contiguous()
     n_out = out.shape[0]
     BLOCK_D = 1024
     grid = (n_out, triton.cdiv(dim, BLOCK_D))
@@ -592,6 +600,59 @@ def scatter_compact_to_strided_into(
         stride,
         dim,
         fill_value,
+        BLOCK_D=BLOCK_D,
+    )
+    return out
+
+
+@triton.jit
+def _gather_strided_to_compact_kernel(
+    strided_ptr,
+    slot_ptr,
+    out_ptr,
+    n_strided,
+    dim,
+    n_out,
+    BLOCK_D: tl.constexpr,
+):
+    p = tl.program_id(0).to(tl.int64)
+    dblk = tl.program_id(1)
+    d = dblk * BLOCK_D + tl.arange(0, BLOCK_D)
+    dmask = d < dim
+    slot = tl.load(slot_ptr + p)
+    # Rows past the layout's coverage address the ghost slot; they read as zero
+    # and are discarded downstream.
+    in_range = slot < n_strided
+    src = tl.where(in_range, slot, 0)
+    val = tl.load(strided_ptr + src * dim + d, mask=dmask & in_range, other=0)
+    val = tl.where(in_range, val, 0)
+    tl.store(out_ptr + p * dim + d, val, mask=dmask)
+
+
+def gather_strided_to_compact_into(
+    *,
+    strided: torch.Tensor,
+    slot_index: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Inverse of scatter_compact_to_strided_into, in one launch.
+
+    `slot_index[p]` is the strided row packed row `p` came from, as
+    ragged_verify_dense_scatter_indices builds it; anything at or past
+    `strided.shape[0]` is the ghost slot and reads back as zero. Writes every
+    row of `out`, so a reused buffer carries nothing stale.
+    """
+    dim = strided.shape[1]
+    BLOCK_D = 1024
+    n_out = out.shape[0]
+    grid = (n_out, triton.cdiv(dim, BLOCK_D))
+    _gather_strided_to_compact_kernel[grid](
+        strided,
+        slot_index,
+        out,
+        strided.shape[0],
+        dim,
+        n_out,
         BLOCK_D=BLOCK_D,
     )
     return out

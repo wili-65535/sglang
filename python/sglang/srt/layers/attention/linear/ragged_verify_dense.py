@@ -2,6 +2,11 @@ from __future__ import annotations
 
 import torch
 
+from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
+    gather_strided_to_compact_into,
+    scatter_compact_to_strided_into,
+)
+
 
 def ragged_verify_dense_scatter_indices(
     *,
@@ -50,3 +55,45 @@ def gather_dense_to_ragged(
     padded = dense_flat.new_zeros(num_dense_tokens + 1, dense_flat.shape[-1])
     padded[:num_dense_tokens] = dense_flat
     return padded[dense_token_indices]
+
+
+def scatter_ragged_to_dense_into(
+    *,
+    packed: torch.Tensor,
+    verify_lens: torch.Tensor,
+    start: torch.Tensor,
+    out: torch.Tensor,
+    draft_token_num: int,
+) -> torch.Tensor:
+    """scatter_ragged_to_dense in one launch, into a caller-owned buffer.
+
+    The kernel writes every row of `out` -- the covered ones from `packed`, the
+    rest zero -- so a buffer reused across layers carries nothing stale. There
+    is no ghost row: tokens past the layout's coverage are simply not read.
+    """
+    return scatter_compact_to_strided_into(
+        compact=packed,
+        verify_lens=verify_lens,
+        start=start,
+        out=out,
+        stride=draft_token_num,
+        fill_value=0,
+    )
+
+
+def gather_dense_to_ragged_into(
+    *,
+    dense_flat: torch.Tensor,
+    dense_token_indices: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """gather_dense_to_ragged in one launch, into a caller-owned buffer.
+
+    Writes every row of `out`; rows whose slot is past `dense_flat` are the
+    uncovered tail and read back as zero, as the padded-ghost-row version did.
+    """
+    return gather_strided_to_compact_into(
+        strided=dense_flat,
+        slot_index=dense_token_indices,
+        out=out,
+    )
