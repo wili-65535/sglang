@@ -9,12 +9,16 @@ Qwen3Next-DSA) adds only the flat per-token index-K cache.
 from __future__ import annotations
 
 from contextlib import nullcontext
+import logging
 from typing import List, Optional
 
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.layers.attention.qsa.metadata import qsa_pending_ring_stride
 from sglang.srt.mem_cache.memory_pool import GB, HybridLinearKVPool, MambaPool
+
+logger = logging.getLogger(__name__)
 
 # State layer IDs are serialized as uint32 by the disaggregation protocols.
 # Reserve the value below PLE's request-wide sentinel for QSA's request-wide
@@ -62,6 +66,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
         qsa_compress_ratio: int,
         qsa_token_topk: int,
         num_request_slots: int,
+        max_write_positions: int = 1,
         enable_memory_saver: bool = False,
         enable_kv_cache_copy: bool = False,
         start_layer: Optional[int] = None,
@@ -123,15 +128,26 @@ class QSATokenToKVPool(HybridLinearKVPool):
         self.qsa_compressed_page_size = page_size // self.qsa_compress_ratio
         self.qsa_compressed_capacity = -(state_size // -self.qsa_compress_ratio)
         # Pre-compression index-K state is a per-request ring, not a per-token cache:
-        # only the pending group's ``ratio`` members must survive a forward,
-        # addressed as ``req_pool_idx * ratio + position % ratio``.
-        # Request slot 0 is never allocated, so rows [0, ratio) are the inert dump.
+        # the pending group's members must survive a forward, addressed as
+        # ``req_pool_idx * stride + position % stride``.
+        # Request slot 0 is never allocated, so rows [0, stride) are the inert dump.
         if num_request_slots <= 0:
             raise ValueError(
                 f"QSA pending ring needs request slots, got {num_request_slots}"
             )
         self.qsa_num_request_slots = int(num_request_slots)
-        ring_slots = self.qsa_num_request_slots * self.qsa_compress_ratio
+        self.qsa_ring_stride = qsa_pending_ring_stride(
+            compress_ratio=self.qsa_compress_ratio,
+            max_write_positions=int(max_write_positions),
+        )
+        ring_slots = self.qsa_num_request_slots * self.qsa_ring_stride
+        logger.info(
+            "QSA pending ring: stride=%d (compress ratio %d), %d request slots, %d rows",
+            self.qsa_ring_stride,
+            self.qsa_compress_ratio,
+            self.qsa_num_request_slots,
+            ring_slots,
+        )
         # These buffers participate in Mooncake PD transfer just like the base
         # KV and Mamba pools.  Keep their allocation in the same memory-saver
         # and Mooncake custom-pool regions; otherwise MNNVL cannot resolve the
@@ -242,7 +258,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
         tensors = [*self.qsa_key_state_buffer_pool, self.qsa_rope_position_buffer]
         return self._get_paged_state_buf_infos(
             tensors,
-            self.qsa_compress_ratio,
+            self.qsa_ring_stride,
         )
 
     def get_qsa_pending_state_layer_ids(self):

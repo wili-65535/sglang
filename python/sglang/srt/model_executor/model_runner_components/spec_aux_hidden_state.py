@@ -42,6 +42,9 @@ class SpecAuxHiddenStateConfig(msgspec.Struct, kw_only=True):
     dflash_use_aux_hidden_state: bool = False
     dflash_draft_num_layers: Optional[int] = None
     dflash_target_layer_ids: Any = None
+    # Width of one tapped target feature the draft's fc was built for. The
+    # target hands its layers all hc streams, so what it captures can be wider.
+    dflash_target_feature_width: Optional[int] = None
     # DFLASH draft KV bytes/token; None when unresolved.
     dflash_draft_cell_size_per_token: int | None = None
 
@@ -205,6 +208,13 @@ def _resolve_dflash_aux_hidden_state(
         config.dflash_use_aux_hidden_state = True
         config.dflash_draft_num_layers = int(draft_num_layers)
         config.dflash_target_layer_ids = target_layer_ids
+        # Resolved with the draft's own hidden size, the one its fc was sized
+        # from, so the number matches that fc by construction.
+        config.dflash_target_feature_width = (
+            dflash_draft_config.resolve_context_feature_width(
+                hidden_size=int(draft_model_config.hf_config.hidden_size)
+            )
+        )
         config.dflash_draft_cell_size_per_token = _resolve_dflash_draft_cell_size(
             draft_model_config=draft_model_config,
             draft_num_layers=int(draft_num_layers),

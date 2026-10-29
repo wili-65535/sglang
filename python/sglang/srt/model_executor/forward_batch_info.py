@@ -1363,9 +1363,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         # target_verify / draft_decode read spec_info.positions; draft_extend
         # passes its own positions (uniform num_draft_tokens per request).
+        ragged_layout = None
         if seq_positions is None:
             seq_positions = batch.spec_info.positions
-        seq_positions = seq_positions.view(batch_size, -1)
+            ragged_layout = batch.spec_info.ragged_verify_layout
+        if ragged_layout is None:
+            seq_positions = seq_positions.view(batch_size, -1)
         # Split text-only and mixed batches here because SpecV2 text-only batches can avoid an extra D2H.
         if all(mm_input is None for mm_input in mm_inputs):
             mrope_delta_tensor = torch.zeros(
@@ -1381,9 +1384,24 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 for i in range(batch_size)
             ]
             mrope_delta_tensor = torch.stack(mrope_deltas, dim=0).to(device=device)
-        next_input_positions = (
-            (seq_positions + mrope_delta_tensor).flatten().unsqueeze(0).repeat(3, 1)
-        )
+        if ragged_layout is None:
+            flat_positions = (seq_positions + mrope_delta_tensor).flatten()
+        else:
+            # Ragged verify rows differ in width, so there is no [bs, width]
+            # view for the [bs, 1] delta to broadcast over; expand per token.
+            flat = seq_positions.view(-1)
+            deltas = torch.repeat_interleave(
+                mrope_delta_tensor.view(-1), ragged_layout.verify_lens
+            )
+            if deltas.shape[0] < flat.shape[0]:
+                # The window is padded up to layout.graph_num_tokens, so its
+                # tail slots belong to no request and verify_lens cannot cover
+                # them; they carry no delta and the forward discards them.
+                deltas = torch.nn.functional.pad(
+                    deltas, (0, flat.shape[0] - deltas.shape[0])
+                )
+            flat_positions = flat + deltas
+        next_input_positions = flat_positions.unsqueeze(0).repeat(3, 1)
 
         self.mrope_positions = next_input_positions
 

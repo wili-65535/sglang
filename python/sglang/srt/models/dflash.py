@@ -692,19 +692,22 @@ class DFlashDraftModel(nn.Module):
         num_context_features = len(target_layer_ids)
 
         self.num_context_features = int(num_context_features)
+        # Not hidden_size when the draft taps hyper-connection streams.
+        self.context_feature_width = draft_config.resolve_context_feature_width(
+            hidden_size=hidden_size
+        )
+        fc_in_features = self.num_context_features * self.context_feature_width
         if self.is_nemotron_35_draft:
             fc_prefix = f"{prefix}.fc" if prefix else "fc"
             self.fc = ReplicatedLinear(
-                self.num_context_features * hidden_size,
+                fc_in_features,
                 hidden_size,
                 bias=False,
                 quant_config=quant_config,
                 prefix=fc_prefix,
             )
         else:
-            self.fc = nn.Linear(
-                self.num_context_features * hidden_size, hidden_size, bias=False
-            )
+            self.fc = nn.Linear(fc_in_features, hidden_size, bias=False)
         self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
         # The model loader calls load_weights() before set_block_size(). Build
@@ -769,7 +772,7 @@ class DFlashDraftModel(nn.Module):
             raise ValueError(
                 "DFLASH target_hidden feature dim mismatch. "
                 f"Expected shape [N, {expected}] "
-                f"(num_context_features={self.num_context_features}, hidden_size={int(self.config.hidden_size)}), "
+                f"(num_context_features={self.num_context_features}, feature_width={self.context_feature_width}), "
                 f"but got shape={tuple(target_hidden.shape)}. "
                 "This usually means the target model is capturing a different number of layer features than "
                 "the draft checkpoint/config expects."
@@ -884,7 +887,10 @@ class DFlashDraftModel(nn.Module):
                     if self.is_nemotron_35_draft:
                         expected_shape = (
                             int(self.config.hidden_size),
-                            int(self.num_context_features * self.config.hidden_size),
+                            int(
+                                self.num_context_features
+                                * self.context_feature_width
+                            ),
                         )
                         loaded_shape = _logical_linear_weight_shape(
                             param,
@@ -904,7 +910,7 @@ class DFlashDraftModel(nn.Module):
                             "DFLASH fc.weight shape mismatch. This usually means the draft checkpoint's "
                             "number of context features (K) does not match this config. "
                             f"Expected fc.weight.shape={expected_shape} "
-                            f"(num_context_features={self.num_context_features}, hidden_size={int(self.config.hidden_size)}), "
+                            f"(num_context_features={self.num_context_features}, feature_width={self.context_feature_width}), "
                             f"but got {loaded_shape} for weight '{name}'."
                         )
                 if resolved_name.startswith(("prefix_gru.", "embed_proj.")) and tuple(
@@ -1001,7 +1007,7 @@ class DFlashLagunaForCausalLM(DFlashDraftModel):
         hidden_size = int(config.hidden_size)
         self.aux_hidden_norms = nn.ModuleList(
             [
-                RMSNorm(hidden_size, eps=rms_norm_eps)
+                RMSNorm(self.context_feature_width, eps=rms_norm_eps)
                 for _ in range(self.num_context_features)
             ]
         )
@@ -1019,7 +1025,7 @@ class DFlashLagunaForCausalLM(DFlashDraftModel):
             raise ValueError(
                 "Laguna DFLASH target_hidden feature dim mismatch. "
                 f"Expected shape [N, {expected}] "
-                f"(num_context_features={self.num_context_features}, hidden_size={int(self.config.hidden_size)}), "
+                f"(num_context_features={self.num_context_features}, feature_width={self.context_feature_width}), "
                 f"but got shape={tuple(target_hidden.shape)}."
             )
 
@@ -1230,11 +1236,26 @@ class DFlash2DraftModel(DFlashDraftModel):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Top-k base candidates via the target lm_head: hidden [N, H] -> global
         candidate_ids / unary_logits [N, K]."""
+        ids, unary, _, _ = self.compute_candidates_with_partition(hidden)
+        return ids, unary
+
+    def compute_candidates_with_partition(
+        self, hidden: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Also the raw head logits and the full-vocabulary log-partition.
+
+        The lattice runs on transformed logits normalized over K candidates,
+        which answers "best of these K" -- too high to use as a confidence. The
+        raw logit of a candidate against the full-vocabulary lse answers "right
+        out of the whole vocabulary", the same quantity a plain DFLASH draft
+        publishes. candidate_topk computes the lse across the vocab shards, so
+        this stays correct under a sharded lm_head.
+        """
         assert self.lm_head is not None, "draft_model.lm_head unset before capture"
-        ids, vals, _ = candidate_topk(
-            hidden, self.lm_head, self.candidate_selector.top_k
+        ids, vals, lse = candidate_topk(
+            hidden, self.lm_head, self.candidate_selector.top_k, with_partition=True
         )
-        return ids, self._transform_unary_logits(vals)
+        return ids, self._transform_unary_logits(vals), vals, lse
 
 
 class MuseGlimmerAssistantModel(DFlashDraftModel):
