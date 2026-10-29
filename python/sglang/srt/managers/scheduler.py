@@ -5327,11 +5327,12 @@ class Scheduler(
                 if_success = False
                 break
             elif k == "dspark_force_budget_frac":
-                if not self.spec_algorithm.is_dspark() or not hasattr(
+                if not self.spec_algorithm.is_dflash_family() or not hasattr(
                     self.draft_worker, "set_dspark_forced_budget_frac"
                 ):
                     logging.warning(
-                        "dspark_force_budget_frac requires a DSpark draft worker."
+                        "dspark_force_budget_frac requires a DFlash-family draft "
+                        "worker."
                     )
                     if_success = False
                     break

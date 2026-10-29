@@ -1012,6 +1012,13 @@ class DFlashWorkerV2(BaseSpecWorker):
     def clear_info_records(self) -> None:
         self._info_dumper.clear()
 
+    def set_dspark_forced_budget_frac(self, frac: Optional[float]) -> None:
+        # Pins the verify budget to frac * full so the SPS profiler can sweep
+        # budget at a fixed batch size; static mode has no planner to pin.
+        if self._verify_planner is None:
+            return
+        self._verify_planner.set_forced_budget_frac(frac)
+
     @property
     def draft_worker(self):
         # DFLASH drives the draft model through a plain TpModelWorker: the
