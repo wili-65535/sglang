@@ -1408,7 +1408,17 @@ class DFlashWorkerV2(BaseSpecWorker):
             return None
         if not _is_all_greedy(batch.sampling_info):
             self._verify_planner.note_non_decode_step()
-            return None
+            # Not None: compact only captures graphs for ragged layouts, so a
+            # None layout here runs the whole step eager (4x slower). Passing
+            # no budget makes the planner hand back the uniform full-window
+            # layout, which verifies everything and replays a captured graph.
+            return self._verify_planner.schedule_layout(
+                req_pool_indices=batch.req_pool_indices,
+                prefix_lens=prefix_lens,
+                device=device,
+                confidence=draft_confidence,
+                budget=None,
+            )
         # Under overlap the scheduler's prepare hook already resolved this from
         # the relayed confidence, off the step's critical path; without the hook
         # this falls back to a host sync on the confidence.
