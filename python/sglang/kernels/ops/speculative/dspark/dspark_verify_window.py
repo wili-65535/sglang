@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Optional
+
 import msgspec
 import torch
 import triton
@@ -414,6 +416,7 @@ def _compact_verify_ids_gather_kernel(
     out_ptr,
     bs,
     gamma,
+    block_stride,
     n,
     BLOCK: tl.constexpr,
 ):
@@ -424,7 +427,11 @@ def _compact_verify_ids_gather_kernel(
     within = tl.load(within_ptr + offs, mask=mask, other=0)
     valid = req < bs
     safe_req = tl.minimum(req, bs - 1)
-    anchor = tl.load(draft_block_ids_ptr + safe_req * gamma, mask=mask, other=0)
+    # draft_block_ids may be wider than draft_tokens (DFLASH hands over the
+    # whole [bs, gamma + 1] block), so it carries its own row stride.
+    anchor = tl.load(
+        draft_block_ids_ptr + safe_req * block_stride, mask=mask, other=0
+    )
     wcol = tl.maximum(within - 1, 0)
     draft = tl.load(draft_tokens_ptr + safe_req * gamma + wcol, mask=mask, other=0)
     v = tl.where(within == 0, anchor, draft)
@@ -453,7 +460,16 @@ def compact_verify_ids_triton(
     BLOCK = 256
     grid = (triton.cdiv(n, BLOCK),)
     _compact_verify_ids_gather_kernel[grid](
-        req, within, draft_block_ids, draft_tokens, out, bs, gamma, n, BLOCK=BLOCK
+        req,
+        within,
+        draft_block_ids,
+        draft_tokens,
+        out,
+        bs,
+        gamma,
+        draft_block_ids.shape[1],
+        n,
+        BLOCK=BLOCK,
     )
     return out
 
@@ -561,12 +577,18 @@ def scatter_compact_to_strided_into(
     out: torch.Tensor,
     stride: int,
     fill_value: float,
+    start: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """`start` is the exclusive prefix sum of `verify_lens`. Pass it when the
+    caller already has it (a query_start_loc prefix, say) to keep the cumsum
+    and the int64 cast off a per-layer path; both tensors are then used as-is.
+    """
     dim = compact.shape[1]
     fill_value = float(fill_value) if out.dtype.is_floating_point else int(fill_value)
-    compact = compact.contiguous()
-    verify_lens = verify_lens.to(dtype=torch.int64).contiguous()
-    start = (torch.cumsum(verify_lens, dim=0) - verify_lens).contiguous()
+    if start is None:
+        compact = compact.contiguous()
+        verify_lens = verify_lens.to(dtype=torch.int64).contiguous()
+        start = (torch.cumsum(verify_lens, dim=0) - verify_lens).contiguous()
     n_out = out.shape[0]
     BLOCK_D = 1024
     grid = (n_out, triton.cdiv(dim, BLOCK_D))
@@ -578,6 +600,59 @@ def scatter_compact_to_strided_into(
         stride,
         dim,
         fill_value,
+        BLOCK_D=BLOCK_D,
+    )
+    return out
+
+
+@triton.jit
+def _gather_strided_to_compact_kernel(
+    strided_ptr,
+    slot_ptr,
+    out_ptr,
+    n_strided,
+    dim,
+    n_out,
+    BLOCK_D: tl.constexpr,
+):
+    p = tl.program_id(0).to(tl.int64)
+    dblk = tl.program_id(1)
+    d = dblk * BLOCK_D + tl.arange(0, BLOCK_D)
+    dmask = d < dim
+    slot = tl.load(slot_ptr + p)
+    # Rows past the layout's coverage address the ghost slot; they read as zero
+    # and are discarded downstream.
+    in_range = slot < n_strided
+    src = tl.where(in_range, slot, 0)
+    val = tl.load(strided_ptr + src * dim + d, mask=dmask & in_range, other=0)
+    val = tl.where(in_range, val, 0)
+    tl.store(out_ptr + p * dim + d, val, mask=dmask)
+
+
+def gather_strided_to_compact_into(
+    *,
+    strided: torch.Tensor,
+    slot_index: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Inverse of scatter_compact_to_strided_into, in one launch.
+
+    `slot_index[p]` is the strided row packed row `p` came from, as
+    ragged_verify_dense_scatter_indices builds it; anything at or past
+    `strided.shape[0]` is the ghost slot and reads back as zero. Writes every
+    row of `out`, so a reused buffer carries nothing stale.
+    """
+    dim = strided.shape[1]
+    BLOCK_D = 1024
+    n_out = out.shape[0]
+    grid = (n_out, triton.cdiv(dim, BLOCK_D))
+    _gather_strided_to_compact_kernel[grid](
+        strided,
+        slot_index,
+        out,
+        strided.shape[0],
+        dim,
+        n_out,
         BLOCK_D=BLOCK_D,
     )
     return out

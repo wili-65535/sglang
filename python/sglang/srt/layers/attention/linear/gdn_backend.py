@@ -12,6 +12,11 @@ from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
+from sglang.srt.layers.attention.linear.ragged_verify_dense import (
+    gather_dense_to_ragged_into,
+    ragged_verify_dense_scatter_indices,
+    scatter_ragged_to_dense_into,
+)
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnBackends,
     LinearAttnKernelBackend,
@@ -513,6 +518,12 @@ class GDNKernelDispatcher:
 class GDNAttnBackend(MambaAttnBackendBase):
     """Attention backend for GDN (Gated Delta Network) linear attention."""
 
+    # Same shape as KDA: the verify path scatters the packed ragged tokens to
+    # its dense [bs, draft_token_num] layout off query_start_loc, which replay
+    # refreshes in place, so nothing here reads back to the host or changes
+    # shape between replays.
+    supports_ragged_verify_graph: bool = True
+
     needs_cpu_seq_lens: bool = False
     supports_mis: bool = True
 
@@ -543,6 +554,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         )
         self._use_strided_target_verify_qkv = False
+        self._ragged_dense: Optional[dict] = None
 
     def init_forward_metadata_out_graph(
         self,
@@ -579,7 +591,21 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     forward_batch, self.forward_metadata, self.device
                 )
 
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        super().init_forward_metadata_in_graph(forward_batch)
+        # Drop the per-step plan here rather than in the out-graph hook:
+        # capture_one runs two warmups and the capture pass through one
+        # run_once(), and only this hook runs inside each of them. Resetting
+        # out-graph only would let the capture reuse the warmup's buffers, which
+        # live outside the graph pool and never refresh on replay.
+        self._ragged_dense = None
+
     def _init_target_verify_qkv_routing(self, forward_batch: ForwardBatch) -> None:
+        # The ragged<->dense plan is a pure function of query_start_loc and the
+        # draft count, so it is the same for every layer in a step; the first
+        # layer of each forward rebuilds it. Replay only runs the out-graph
+        # hook, so clear it here too.
+        self._ragged_dense = None
         # CUDA-graph metadata leaves mode and draft count at their defaults.
         if not forward_batch.forward_mode.is_target_verify():
             self._use_strided_target_verify_qkv = False
@@ -606,6 +632,40 @@ class GDNAttnBackend(MambaAttnBackendBase):
             ssm_dtype=mamba_cache.temporal.dtype,
             draft_token_num=forward_batch.spec_info.draft_token_num,
         )
+
+    def _ragged_dense_plan(
+        self,
+        *,
+        query_start_loc: torch.Tensor,
+        seq_len: int,
+        draft_token_num: int,
+        batch_size: int,
+        like: torch.Tensor,
+    ) -> dict:
+        """Per-step plan and scratch for the ragged<->dense qkv round trip.
+
+        Everything here depends only on the step's layout and the qkv width,
+        both constant across layers, so the first layer builds it and the other
+        35 reuse it. The two scratch buffers are safe to share because each
+        kernel writes every row it owns.
+        """
+        plan = self._ragged_dense
+        if plan is not None:
+            return plan
+        starts = query_start_loc[:batch_size]
+        plan = {
+            "slots": ragged_verify_dense_scatter_indices(
+                query_start_loc=query_start_loc,
+                seq_len=seq_len,
+                draft_token_num=draft_token_num,
+            ),
+            "verify_lens": (query_start_loc[1:] - query_start_loc[:-1]).to(torch.int64),
+            "start": starts.to(torch.int64),
+            "dense": like.new_empty(batch_size * draft_token_num, like.shape[-1]),
+            "packed": like.new_empty(seq_len, like.shape[-1]),
+        }
+        self._ragged_dense = plan
+        return plan
 
     def _replayssm_fold_uses_cutedsl(
         self, ssm_dtype: torch.dtype, draft_token_num: int
@@ -971,11 +1031,33 @@ class GDNAttnBackend(MambaAttnBackendBase):
             state_cache_indices = cache_indices
 
         if is_target_verify:
-            batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
-            mixed_qkv_reshaped = mixed_qkv.view(
-                batch_size, draft_token_num, -1
-            ).transpose(1, 2)
+            ragged_layout = forward_batch.spec_info.ragged_verify_layout
+            if ragged_layout is None:
+                batch_size = seq_len // draft_token_num
+                dense_token_indices = None
+                mixed_qkv_dense = mixed_qkv.view(batch_size, draft_token_num, -1)
+            else:
+                # causal_conv1d_update wants one row per request of a fixed
+                # width; ragged verify packs rows of different widths, so
+                # scatter to the dense layout and gather back after.
+                batch_size = query_start_loc.shape[0] - 1
+                plan = self._ragged_dense_plan(
+                    query_start_loc=query_start_loc,
+                    seq_len=seq_len,
+                    draft_token_num=draft_token_num,
+                    batch_size=batch_size,
+                    like=mixed_qkv,
+                )
+                dense_token_indices = plan["slots"]
+                mixed_qkv_dense = scatter_ragged_to_dense_into(
+                    packed=mixed_qkv,
+                    verify_lens=plan["verify_lens"],
+                    start=plan["start"],
+                    out=plan["dense"],
+                    draft_token_num=draft_token_num,
+                ).view(batch_size, draft_token_num, -1)
+            mixed_qkv_reshaped = mixed_qkv_dense.transpose(1, 2)
             mixed_qkv_processed = causal_conv1d_update(
                 mixed_qkv_reshaped,
                 conv_states,
@@ -989,7 +1071,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 retrieve_next_sibling=retrieve_next_sibling,
                 retrieve_parent_token=retrieve_parent_token,
             )
-            mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
+            mixed_qkv_flat = mixed_qkv_processed.transpose(1, 2).reshape(
+                batch_size * draft_token_num, -1
+            )
+            if dense_token_indices is None:
+                mixed_qkv = mixed_qkv_flat.view(seq_len, -1)
+            else:
+                mixed_qkv = gather_dense_to_ragged_into(
+                    dense_flat=mixed_qkv_flat,
+                    dense_token_indices=dense_token_indices,
+                    out=plan["packed"],
+                )
         else:
             mixed_qkv = mixed_qkv.transpose(0, 1)
             if forward_metadata.has_mamba_track_mask:

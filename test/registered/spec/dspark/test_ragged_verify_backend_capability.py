@@ -28,12 +28,18 @@ class TestRaggedVerifyGraphCapability(CustomTestCase):
         from sglang.srt.layers.attention.flashattention_backend import (
             FlashAttentionBackend,
         )
+        from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
+        from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+            QwenSparseAttnBackend,
+        )
         from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 
         for backend in (
             TRTLLMHAAttnBackend,
             DeepseekV4AttnBackend,
             FlashAttentionBackend,
+            QwenSparseAttnBackend,
+            GDNAttnBackend,
         ):
             with self.subTest(backend=backend.__name__):
                 self.assertTrue(backend.supports_ragged_verify_graph)

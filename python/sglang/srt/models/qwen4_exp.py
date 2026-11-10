@@ -1,6 +1,8 @@
 """Inference-only Qwen4-Exp (text + VL) on the Qwen3.5 backbone."""
 
+import json
 import math
+import os
 from contextlib import nullcontext
 from typing import Any, Iterable, Optional, Set, Tuple, Union
 
@@ -21,7 +23,10 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
+from sglang.srt.layers.aux_hidden_states import (
+    AuxHiddenStateAccumulator,
+    AuxHiddenStateList,
+)
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather,
     attn_tp_all_reduce,
@@ -73,6 +78,7 @@ from sglang.srt.models.qwen4_exp_ple_table import (
     make_ple_file_rss_trimmer,
 )
 from sglang.srt.runtime_context import get_forward, get_parallel
+from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.utils import get_bool_env_var, is_hip, logger
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
@@ -132,9 +138,21 @@ class _PLEBatch(msgspec.Struct, frozen=True):
     req_indices: torch.Tensor
     token_offsets: torch.Tensor
     valid_tokens: torch.Tensor
+    # [bs, row_width]; the dense-layout twin of valid_tokens. Ragged verify packs
+    # rows end to end, so the flat mask has no [bs, row_width] view to reshape to.
+    valid_steps: Optional[torch.Tensor]
     state_indices: torch.Tensor
     ngram_context: Optional[torch.Tensor]
     ngram_eos_token_id: Optional[int]
+
+
+def _rows_any(
+    flat: torch.Tensor, req_indices: torch.Tensor, sequence_count: int
+) -> torch.Tensor:
+    """Per-row OR of a flat per-token mask, without a [bs, row_width] view."""
+    hits = torch.zeros(sequence_count, dtype=torch.int32, device=flat.device)
+    hits.index_add_(0, req_indices, flat.to(torch.int32))
+    return hits.ne(0)
 
 
 def _prepare_ple_batch(
@@ -175,32 +193,46 @@ def _prepare_ple_batch(
     if mode.is_target_verify():
         assert forward_batch.spec_info is not None
         row_width = int(forward_batch.spec_info.draft_token_num)
-        if row_width <= 0 or processed_tokens % row_width != 0:
-            raise RuntimeError(
-                "target verify rows must contain complete draft strides: "
-                f"{processed_tokens=} {row_width=}"
+        ragged_layout = resolve_ragged_verify_layout(forward_batch)
+        if ragged_layout is not None:
+            # Compact ragged verify gives each row its own budget and packs the
+            # rows end to end, so a token's row is a search in qo_indptr rather
+            # than a division by the stride. The dense [bs, row_width] working
+            # layout still holds: no row exceeds the stride.
+            lengths = ragged_layout.verify_lens.long()
+            sequence_count = lengths.shape[0]
+            query_start_loc = ragged_layout.qo_indptr_device.long()
+            req_indices = torch.searchsorted(
+                query_start_loc[1:], positions, right=True
+            ).clamp(max=sequence_count - 1)
+            token_offsets = positions - query_start_loc.index_select(0, req_indices)
+        else:
+            if row_width <= 0 or processed_tokens % row_width != 0:
+                raise RuntimeError(
+                    "target verify rows must contain complete draft strides: "
+                    f"{processed_tokens=} {row_width=}"
+                )
+            sequence_count = processed_tokens // row_width
+            # Eager verify rows can be shorter than the row stride;
+            # ignore the synthetic one-token lengths from DP attention's verify-as-EXTEND.
+            lengths = (
+                forward_batch.extend_seq_lens[:sequence_count].long()
+                if forward_batch.forward_mode.is_target_verify()
+                and forward_batch.extend_seq_lens is not None
+                else torch.full(
+                    (sequence_count,),
+                    row_width,
+                    dtype=torch.long,
+                    device=tokens.device,
+                )
             )
-        sequence_count = processed_tokens // row_width
-        # Eager verify rows can be shorter than the row stride;
-        # ignore the synthetic one-token lengths from DP attention's verify-as-EXTEND.
-        lengths = (
-            forward_batch.extend_seq_lens[:sequence_count].long()
-            if forward_batch.forward_mode.is_target_verify()
-            and forward_batch.extend_seq_lens is not None
-            else torch.full(
-                (sequence_count,),
-                row_width,
-                dtype=torch.long,
-                device=tokens.device,
-            )
-        )
-        if lengths.shape[0] != sequence_count:
-            raise RuntimeError(
-                "target verify length metadata does not match its fixed rows: "
-                f"{lengths.shape[0]=} {sequence_count=}"
-            )
-        req_indices = torch.div(positions, row_width, rounding_mode="floor")
-        token_offsets = positions - req_indices * row_width
+            if lengths.shape[0] != sequence_count:
+                raise RuntimeError(
+                    "target verify length metadata does not match its fixed rows: "
+                    f"{lengths.shape[0]=} {sequence_count=}"
+                )
+            req_indices = torch.div(positions, row_width, rounding_mode="floor")
+            token_offsets = positions - req_indices * row_width
     elif mode.is_decode():
         lengths = torch.ones(processed_tokens, dtype=torch.long, device=tokens.device)
         row_width = 1
@@ -231,8 +263,21 @@ def _prepare_ple_batch(
         valid_tokens = torch.ones(
             processed_tokens, dtype=torch.bool, device=tokens.device
         )
+        valid_steps = None
     else:
         valid_tokens = token_offsets < lengths.index_select(0, req_indices)
+        valid_steps = (
+            torch.arange(row_width, device=tokens.device, dtype=torch.long).unsqueeze(0)
+            < lengths.unsqueeze(1)
+            if mode.is_target_verify()
+            else None
+        )
+        # Under cuda-graph replay the batch is padded to the graph tier while
+        # the staged ragged layout covers only the live tokens, so the tail
+        # offsets run past their row. Validity is already decided above; pull
+        # the index itself back in range for the dense [rows, row_width]
+        # consumers, and route the writes among them to a scratch row.
+        token_offsets = token_offsets.clamp(min=0, max=row_width - 1)
 
     state_indices = (
         get_req_to_token_pool()
@@ -255,9 +300,9 @@ def _prepare_ple_batch(
         if out_cache_loc is not None and mode.is_decode():
             valid = valid & out_cache_loc[:sequence_count].ne(0)
         elif out_cache_loc is not None and mode.is_target_verify():
-            valid = valid & out_cache_loc[:processed_tokens].reshape(
-                sequence_count, row_width
-            ).ne(0).any(dim=1)
+            valid = valid & _rows_any(
+                out_cache_loc[:processed_tokens].ne(0), req_indices, sequence_count
+            )
         state_indices = torch.where(
             valid, state_indices, torch.zeros_like(state_indices)
         )
@@ -270,13 +315,18 @@ def _prepare_ple_batch(
             # this view is the padded tensor the general path would materialize.
             padded = tokens.unsqueeze(1)
         else:
-            padded = tokens.new_full((sequence_count, row_width), ngram_eos_token_id)
+            padded = tokens.new_full(
+                (sequence_count + 1, row_width), ngram_eos_token_id
+            )
             if processed_tokens:
-                padded[req_indices, token_offsets] = torch.where(
+                scatter_rows = torch.where(valid_tokens, req_indices, sequence_count)
+                scatter_cols = token_offsets.clamp(min=0, max=row_width - 1)
+                padded[scatter_rows, scatter_cols] = torch.where(
                     valid_tokens,
                     tokens,
                     tokens.new_full((), ngram_eos_token_id),
                 )
+            padded = padded[:sequence_count]
         history = get_req_to_token_pool().get_ngram_context(state_indices)
         if history.shape[1] != ngram_size - 1:
             raise RuntimeError(
@@ -295,10 +345,88 @@ def _prepare_ple_batch(
         req_indices=req_indices,
         token_offsets=token_offsets,
         valid_tokens=valid_tokens,
+        valid_steps=valid_steps,
         state_indices=state_indices,
         ngram_context=ngram_context,
         ngram_eos_token_id=ngram_eos_token_id,
     )
+
+
+class _LayerDump:
+    """Per-layer hidden-state fingerprints for one forward, keyed by position.
+
+    Fingerprint is the row's fp32 norm plus its first eight elements: enough to
+    tell two activations apart, small enough to keep every layer of every step.
+    """
+
+    def __init__(self, path: str, positions: torch.Tensor, mode: str, num_layers: int):
+        self.path = path
+        self.positions = positions.detach().to("cpu", torch.int64).tolist()
+        self.mode = mode
+        self.num_layers = num_layers
+        self.rows = []
+
+    @classmethod
+    def begin(
+        cls, forward_batch: ForwardBatch, num_layers: int
+    ) -> Optional["_LayerDump"]:
+        path = envs.SGLANG_QWEN4_DEBUG_LAYER_DUMP.get()
+        if not path:
+            return None
+        positions = forward_batch.positions
+        if positions is None:
+            return None
+        # Copying to host is illegal inside a capture, and a replay never runs
+        # this code at all -- so a graph-backed decode cannot be observed here.
+        # Run the diagnostic with the decode graph disabled.
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            return None
+        if positions.ndim == 2:
+            positions = positions[0]
+        # The directory may only exist outside the container that runs this.
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        # One file per rank: the ranks share the path and would interleave lines.
+        return cls(
+            f"{path}.{os.getpid()}",
+            positions.flatten(),
+            forward_batch.forward_mode.name,
+            num_layers,
+        )
+
+    def record(self, layer_id: int, hidden: torch.Tensor, residual) -> None:
+        x = hidden if residual is None else hidden + residual
+        x = x.reshape(-1, x.shape[-1])[: len(self.positions)].float()
+        self.rows.append(
+            (layer_id, x.norm(dim=-1).cpu().tolist(), x[:, :8].cpu().tolist())
+        )
+
+    def flush(self) -> None:
+        # A debug dump must not take the scheduler down with it.
+        try:
+            self._write()
+        except OSError as e:
+            logger.warning("Qwen4 layer dump to %s failed: %s", self.path, e)
+
+    def _write(self) -> None:
+        with open(self.path, "a") as f:
+            for layer_id, norms, head in self.rows:
+                f.write(
+                    json.dumps(
+                        {
+                            "mode": self.mode,
+                            # Target and draft share this class and both start
+                            # at layer 0; without this the two interleave.
+                            "nlayers": self.num_layers,
+                            "layer": layer_id,
+                            "positions": self.positions,
+                            "norms": norms,
+                            "head": head,
+                        }
+                    )
+                    + "\n"
+                )
 
 
 def _commit_ple_batch(batch: Optional[_PLEBatch], forward_batch: ForwardBatch) -> None:
@@ -312,12 +440,10 @@ def _commit_ple_batch(batch: Optional[_PLEBatch], forward_batch: ForwardBatch) -
     context_len = context.shape[1] - batch.row_width
     if batch.mode.is_target_verify():
         step_contexts = context.unfold(1, context_len, 1)[:, 1:]
-        valid_steps = batch.valid_tokens.reshape(
-            batch.lengths.shape[0], batch.row_width
-        )
+        assert batch.valid_steps is not None
         pool.set_ngram_intermediate_context(
             torch.where(
-                valid_steps.unsqueeze(-1),
+                batch.valid_steps.unsqueeze(-1),
                 step_contexts,
                 torch.full_like(step_contexts, batch.ngram_eos_token_id),
             )
@@ -1056,10 +1182,15 @@ class Qwen4ExpPLELayer(nn.Module):
             return F.silu(conv_output)
 
         state = conv_state.index_select(0, batch.state_indices).to(dtype=x.dtype)
+        scratch_row = batch.lengths.shape[0]
         padded_seq = x.new_zeros(
-            (batch.lengths.shape[0], batch.row_width, self.conv_channels)
+            (scratch_row + 1, batch.row_width, self.conv_channels)
         )
-        padded_seq[batch.req_indices, batch.token_offsets] = x
+        padded_seq[
+            torch.where(batch.valid_tokens, batch.req_indices, scratch_row),
+            batch.token_offsets,
+        ] = x
+        padded_seq = padded_seq[:scratch_row]
         conv_input = torch.cat([state, padded_seq.transpose(1, 2)], dim=-1)
         conv_output = F.conv1d(
             conv_input,
@@ -1089,11 +1220,9 @@ class Qwen4ExpPLELayer(nn.Module):
                             0,
                         )
                     )
-                valid_steps = batch.valid_tokens.reshape(
-                    batch.lengths.shape[0], batch.row_width, 1, 1
-                )
+                assert batch.valid_steps is not None
                 intermediate_state = torch.where(
-                    valid_steps,
+                    batch.valid_steps[:, :, None, None],
                     intermediate_state,
                     torch.zeros_like(intermediate_state),
                 )
@@ -1368,6 +1497,7 @@ class Qwen4ExpLayerExtensionMixin:
         forward_batch: ForwardBatch,
         *,
         ple_batch: Optional[_PLEBatch],
+        captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
     ):
         hc_dim = self.hc_count * self.hidden_size
         if hidden_states.shape[-1] != hc_dim:
@@ -1375,6 +1505,12 @@ class Qwen4ExpLayerExtensionMixin:
             hidden_states = torch.cat(
                 [hidden_states for _ in range(self.hc_count)], dim=-1
             )
+
+        # Layers hand each other the full hc stream (residual is None between
+        # them), so this layer's input is the previous layer's output -- the
+        # hc_count * hidden_size feature a post_layer_hc DFlash draft taps.
+        if captured_last_layer_outputs is not None:
+            captured_last_layer_outputs.capture(hidden_states)
 
         if self.ple is not None:
             if ple_batch is None:
@@ -1503,6 +1639,7 @@ class Qwen4ExpLinearDecoderLayer(
             residual,
             forward_batch,
             ple_batch=kwargs.get("ple_batch"),
+            captured_last_layer_outputs=kwargs.get("captured_last_layer_outputs"),
         )
 
         if not forward_batch.forward_mode.is_idle():
@@ -1646,6 +1783,7 @@ class Qwen4ExpAttentionDecoderLayer(
             residual,
             forward_batch,
             ple_batch=kwargs.get("ple_batch"),
+            captured_last_layer_outputs=kwargs.get("captured_last_layer_outputs"),
         )
 
         if not forward_batch.forward_mode.is_idle():
@@ -1692,6 +1830,9 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         super().__init__(config, quant_config, prefix, is_nextn)
         self.hc_count = config.hc_count
         self.hidden_size = config.hidden_size
+        # Set from the draft config at capture setup; None means "emit whatever
+        # the layers carry", which is every hc stream.
+        self.dflash_target_feature_width = None
         self.has_ple = any(
             self.layers[layer_id].ple is not None
             for layer_id in range(self.start_layer, self.end_layer)
@@ -1753,6 +1894,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             else None
         )
         aux_hidden_states = AuxHiddenStateList()
+        layer_dump = _LayerDump.begin(forward_batch, len(self.layers))
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             if i + 1 < self.end_layer:
@@ -1772,6 +1914,11 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                         else None
                     ),
                 )
+            if layer_dump is not None:
+                layer_dump.record(i, hidden_states, residual)
+
+        if layer_dump is not None:
+            layer_dump.flush()
 
         _commit_ple_batch(ple_batch, forward_batch)
 
@@ -1783,12 +1930,42 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
 
         hc_hidden_states = hidden_states
         hidden_states, _ = self.hyper_connection_mixer.mix(hidden_states)
-        if not forward_batch.forward_mode.is_idle():
-            return hidden_states, hc_hidden_states
+        # Always (hidden, hc streams, DFlash captures): an arity that varied by
+        # forward mode made callers guess, and the non-idle shape they guessed
+        # dropped the captures.
+        captured = (
+            self._narrow_dflash_captures(aux_hidden_states)
+            if len(aux_hidden_states) > 0
+            else None
+        )
+        return hidden_states, hc_hidden_states, captured
 
-        if len(aux_hidden_states) == 0:
-            return hidden_states
-        return hidden_states, aux_hidden_states
+    def set_dflash_target_feature_width(self, width: int) -> None:
+        """Width of one tapped feature the draft's fc was built for."""
+        self.dflash_target_feature_width = int(width)
+
+    def _narrow_dflash_captures(self, captures):
+        """Reduce each tapped feature to the width the draft expects.
+
+        Layers hand each other every hyper-connection stream, so a capture is
+        hc_count * hidden_size wide. A draft trained on the stream mean wants
+        hidden_size back; one trained on the concatenated streams wants all of
+        it. Which one is a property of the draft checkpoint, so it is resolved
+        from the draft config rather than assumed here.
+        """
+        want = self.dflash_target_feature_width
+        have = captures[0].shape[-1]
+        if want is None or want == have:
+            return captures
+        if want * self.hc_count != have:
+            raise ValueError(
+                "DFLASH draft expects a tapped feature of width "
+                f"{want}, but the target captured {have}; that is neither the "
+                f"same width nor hc_count={self.hc_count} streams of it."
+            )
+        return [
+            c.unflatten(-1, (self.hc_count, want)).mean(dim=-2) for c in captures
+        ]
 
 
 class Qwen4ExpVLModel(Qwen4ExpModel):
@@ -1828,14 +2005,23 @@ class Qwen4ExpVLModel(Qwen4ExpModel):
         if isinstance(model_output, PPProxyTensors):
             return model_output
         if isinstance(model_output, tuple):
-            hidden_states, self.last_hc_hidden_states = model_output
-            return hidden_states
+            hidden_states, self.last_hc_hidden_states, captured = model_output
+            # The caller unpacks on capture_aux_hidden_states, fixed at setup,
+            # so the arity cannot depend on what this one forward captured: the
+            # autotune warmup runs no layers and captures nothing, and a bare
+            # tensor returned there is unpacked by row.
+            if not self.layers_to_capture:
+                return hidden_states
+            return hidden_states, captured
         return model_output
 
 
 class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
     hf_to_sglang_mapper = None
+
+    def set_dflash_target_feature_width(self, width: int) -> None:
+        self.model.set_dflash_target_feature_width(width)
 
     @staticmethod
     def shared_experts_fusion_disable_reason(hf_config, quant_config):
@@ -1882,8 +2068,17 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             get_embedding=get_embedding,
             pp_proxy_tensors=pp_proxy_tensors,
         )
+        # Two drafts read output.hidden_states and want different things: the
+        # MTP head wants the hc streams, while an external DFlash draft wants
+        # the tapped layer features the logits processor already packed there
+        # (num taps * hc width). Overwriting unconditionally handed the DFlash
+        # draft one tap's width and tripped its fc shape check.
         hc_hidden_states = self.model.last_hc_hidden_states
-        if hc_hidden_states is not None and isinstance(output, LogitsProcessorOutput):
+        if (
+            not self.capture_aux_hidden_states
+            and hc_hidden_states is not None
+            and isinstance(output, LogitsProcessorOutput)
+        ):
             output.hidden_states = hc_hidden_states
         return output
 
