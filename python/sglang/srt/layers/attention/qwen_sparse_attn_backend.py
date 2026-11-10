@@ -38,6 +38,7 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     sparse_gqa_packed_decode_triton,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.utils import is_hip
 
 logger = logging.getLogger(__name__)
@@ -172,6 +173,11 @@ class QSAMTPSharedSparseIndices:
 class QwenSparseAttnBackend(AttentionBackend):
     """QSA backend using trtllm-gen decode with a packed FA2/FA4 fallback."""
 
+    # Ragged verify under cuda graph: the layout kernel's mode 3 packs the
+    # rows at per-request widths and the tail rows land on the inert request
+    # slot 0, so replay needs no host readback and no shape change.
+    supports_ragged_verify_graph: bool = True
+
     # Every seq_lens_cpu read here has a device fallback (one readback);
     # the graphed decode path never reads it, so opting out is safe.
     needs_cpu_seq_lens: bool = False
@@ -191,12 +197,18 @@ class QwenSparseAttnBackend(AttentionBackend):
             if self.qsa_profile is not None
             else int(getattr(config, "indexer_compress_ratio", 4))
         )
+        # The pool allocated the ring, so it owns the stride.
+        self.ring_stride = (
+            self.compress_ratio
+            if self.token_to_kv_pool is None
+            else self.token_to_kv_pool.qsa_ring_stride
+        )
         req_pool = getattr(runner, "req_to_token_pool", None)
         self.req_to_token = getattr(req_pool, "req_to_token", None)
         self.req_to_token_pool = req_pool
         self.forward_metadata: Optional[QwenSparseAttnMetadata] = None
         self._cuda_graph_metadata: Dict[
-            Tuple[ForwardMode, int], QwenSparseAttnMetadata
+            Tuple[ForwardMode, int, int], QwenSparseAttnMetadata
         ] = {}
         self._cuda_graph_max_tokens = 0
         self._fa2_scratch: Dict[
@@ -235,13 +247,13 @@ class QwenSparseAttnBackend(AttentionBackend):
                 "Qwen QSA target verification supports only speculative_eagle_topk=1"
             )
         draft_tokens = int(getattr(spec_info, "draft_token_num", 0) or 0)
-        if draft_tokens > self.compress_ratio:
-            # The pending-group ring keys state by position % ratio; a verify
-            # window wider than the ratio would collide within one forward.
+        if draft_tokens > self.ring_stride:
+            # The ring keys state by position % stride, so a forward writing
+            # more positions than the stride would collide within itself.
             raise NotImplementedError(
-                "Qwen QSA requires speculative_num_draft_tokens <= the QSA "
-                f"compress ratio ({self.compress_ratio}): the pending "
-                f"index-key ring holds one group; got {draft_tokens}"
+                "Qwen QSA sized its pending index-key ring for a verify window "
+                f"of {self.ring_stride} (compress ratio {self.compress_ratio}); "
+                f"got {draft_tokens}"
             )
 
     @staticmethod
@@ -282,11 +294,21 @@ class QwenSparseAttnBackend(AttentionBackend):
                 "QSA speculative query rows cannot be mapped to an empty batch: "
                 f"rows={num_rows}"
             )
+        layout = resolve_ragged_verify_layout(forward_batch)
         extend_seq_lens = getattr(forward_batch, "extend_seq_lens", None)
-        if extend_seq_lens is not None:
+        if layout is not None:
+            # Compact ragged verify packs the rows at per-request verify budgets,
+            # so rows/batch is not the stride; the row widths are the layout's.
+            repeats = layout.verify_lens[:batch_size].to(
+                device=forward_batch.req_pool_indices.device, dtype=torch.long
+            )
+        elif extend_seq_lens is not None:
+            repeats = extend_seq_lens[:batch_size].to(dtype=torch.long)
+        else:
+            repeats = None
+        if repeats is not None:
             # DP token padding rows belong to no request; alias them to request row 0,
             # as the CUDA-graph layout does, so gathers stay in bounds.
-            repeats = extend_seq_lens[:batch_size].to(dtype=torch.long)
             real_rows = int(repeats.sum().item())
             if real_rows > num_rows:
                 raise ValueError(
@@ -327,6 +349,40 @@ class QwenSparseAttnBackend(AttentionBackend):
             return values[:size].detach().cpu().to(torch.int32)
         return torch.tensor(values[:size], dtype=torch.int32)
 
+    @staticmethod
+    def _graph_metadata_key(forward_mode, bs: int, spec_info) -> Tuple:
+        """Cache key for one captured graph's row-sized metadata views.
+
+        Ragged verify captures several token tiers at the same bs, and each
+        tier's views are sliced to its own row count, so bs alone would let
+        the last captured tier's views serve every replay.
+        """
+        layout = (
+            spec_info.ragged_verify_layout
+            if forward_mode.is_target_verify() and spec_info is not None
+            else None
+        )
+        return (forward_mode, bs, 0 if layout is None else layout.graph_num_tokens)
+
+    @staticmethod
+    def _ragged_verify_lens(spec_info, bs: int):
+        """Per-request verify widths for this step, or None for uniform width.
+
+        Capped at draft_token_num on purpose. The full-coverage variant spreads
+        the graph tier's leftover tokens over the real requests, and QSA keys
+        its pending ring on (request, position), so those surplus rows would
+        write into a live request's ring. Capped, they fall past the packed
+        layout and the layout kernel's tail hands them request slot 0, which is
+        never allocated and therefore inert.
+        """
+        layout = spec_info.ragged_verify_layout
+        if layout is None:
+            return None
+        cap = int(spec_info.draft_token_num)
+        if layout.bs != bs or layout.cap != cap:
+            layout = layout.padded_to_bucket(padded_bs=bs, cap=cap)
+        return layout.verify_lens
+
     @classmethod
     def _graph_speculative_layout(
         cls,
@@ -340,8 +396,12 @@ class QwenSparseAttnBackend(AttentionBackend):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         base_lengths = cls._as_cpu_int_tensor(seq_lens_cpu, bs)
         if forward_mode.is_target_verify():
-            extend_len = int(spec_info.draft_token_num)
-            extend_lengths = torch.full((bs,), extend_len, dtype=torch.int32)
+            verify_lens = cls._ragged_verify_lens(spec_info, bs)
+            if verify_lens is None:
+                extend_len = int(spec_info.draft_token_num)
+                extend_lengths = torch.full((bs,), extend_len, dtype=torch.int32)
+            else:
+                extend_lengths = verify_lens.to(device="cpu", dtype=torch.int32)
         else:
             extend_lengths_cpu = getattr(spec_info, "extend_seq_lens_cpu", None)
             if extend_lengths_cpu is not None:
@@ -439,6 +499,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             out_cache_loc=out_cache_loc,
             token_to_kv_pool=self.token_to_kv_pool,
             compress_ratio=self.token_to_kv_pool.qsa_compress_ratio,
+            ring_stride=self.ring_stride,
             block_topk=self.token_to_kv_pool.qsa_block_topk,
         )
         return QwenSparseAttnMetadata(
@@ -675,6 +736,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 sequence_lengths=sequence_lengths,
                 logical_positions=ring_logical_positions,
                 compress_ratio=self.compress_ratio,
+                ring_stride=self.ring_stride,
                 is_extend=group_member_rows is not None,
             )
             if write_locs.numel():
@@ -693,6 +755,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                         group_end_positions=group_positions.long(),
                         sequence_ids=group_sequence_ids.long(),
                         compress_ratio=self.compress_ratio,
+                        ring_stride=self.ring_stride,
                     )
         indexer_metadata = QSAIndexerMetadata(
             sequence_lengths=sequence_lengths,
@@ -701,6 +764,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             out_cache_loc=forward_batch.out_cache_loc,
             token_to_kv_pool=self.token_to_kv_pool,
             compress_ratio=self.token_to_kv_pool.qsa_compress_ratio,
+            ring_stride=self.ring_stride,
             block_topk=self.token_to_kv_pool.qsa_block_topk,
             req_pool_indices=row_req_pool_indices,
             write_locs=write_locs,
@@ -885,6 +949,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             out_cache_loc=self._graph_dummy_out_cache_loc[:metadata_rows],
             token_to_kv_pool=pool,
             compress_ratio=pool.qsa_compress_ratio,
+            ring_stride=self.ring_stride,
             block_topk=pool.qsa_block_topk,
             req_pool_indices=self._graph_row_req_pool_indices[:metadata_rows],
             is_cuda_graph=True,
@@ -909,7 +974,9 @@ class QwenSparseAttnBackend(AttentionBackend):
             fa2_cu_seqlens_k=self._graph_fa2_cu_seqlens_k[: metadata_rows + 1],
             fa2_cu_seqlens_q=self._graph_cu_seqlens_q[: metadata_rows + 1],
         )
-        self._cuda_graph_metadata[(forward_mode, bs)] = metadata
+        self._cuda_graph_metadata[
+            self._graph_metadata_key(forward_mode, bs, spec_info)
+        ] = metadata
         self.forward_metadata = metadata
 
     def _replay_cuda_graph_metadata(
@@ -924,7 +991,9 @@ class QwenSparseAttnBackend(AttentionBackend):
         num_padding: int = 0,
     ) -> None:
         self._require_chain_speculation(forward_mode, spec_info)
-        metadata = self._cuda_graph_metadata[(forward_mode, bs)]
+        metadata = self._cuda_graph_metadata[
+            self._graph_metadata_key(forward_mode, bs, spec_info)
+        ]
         # Compressed addressing is arithmetic over req_to_token; pure reads below.
         if self._can_replay_with_gpu_kernels(metadata, seq_lens):
             self._replay_cuda_graph_metadata_gpu(
@@ -1031,9 +1100,19 @@ class QwenSparseAttnBackend(AttentionBackend):
 
         if speculative:
             if forward_mode.is_target_verify():
-                mode = 1
-                extend_lens = None
-                extend_len = int(spec_info.draft_token_num)
+                extend_lens = self._ragged_verify_lens(spec_info, bs)
+                if extend_lens is None:
+                    mode = 1
+                    extend_len = int(spec_info.draft_token_num)
+                else:
+                    # Ragged verify: the rows are packed at per-request widths,
+                    # so the uniform stride of mode 1 would misplace every
+                    # request after the first.
+                    mode = 3
+                    extend_len = 0
+                    extend_lens = extend_lens.to(
+                        device=seq_lens.device, dtype=torch.int32
+                    )
             else:
                 mode = 2
                 extend_len = 0
@@ -1091,6 +1170,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 sequence_lengths=metadata.sequence_lengths,
                 logical_positions=current_positions,
                 compress_ratio=ratio,
+                ring_stride=self.ring_stride,
                 is_extend=False,
             )
         )
@@ -1100,6 +1180,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 group_end_positions=current_positions,
                 sequence_ids=metadata.token_to_batch_idx.long(),
                 compress_ratio=ratio,
+                ring_stride=self.ring_stride,
             ).to(torch.int32)
         )
 

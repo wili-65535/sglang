@@ -30,8 +30,9 @@ def _qsa_graph_layout_kernel(
     bs,
     num_tokens,
     num_padding,
-    extend_len,  # uniform extend length (target verify); 0 -> extend_lens_ptr
-    MODE: tl.constexpr,  # 0 = decode, 1 = target verify, 2 = draft extend
+    extend_len,  # uniform extend length (target verify); unused when ragged
+    MODE: tl.constexpr,  # 0 = decode, 1 = target verify, 2 = draft extend,
+    # 3 = ragged target verify (per-request widths, verify row semantics)
 ):
     pid = tl.program_id(0)
 
@@ -72,6 +73,8 @@ def _qsa_graph_layout_kernel(
         eff = tl.where(pid < real_reqs, extend_len, 0)
         offset = tl.minimum(pid, real_reqs) * extend_len
     else:
+        # Modes 2 and 3 both pack rows at per-request widths, so a row's
+        # offset is the prefix sum of the widths before it.
         eff = 0
         offset = 0
         for j in range(bs):
@@ -80,7 +83,9 @@ def _qsa_graph_layout_kernel(
             eff = tl.where(j == pid, e_j, eff)
     base = tl.load(seq_lens_ptr + pid).to(tl.int32)
     req = tl.load(req_pool_ptr + pid).to(tl.int64)
-    if MODE == 1:
+    if MODE == 1 or MODE == 3:
+        # Verify rows extend past the committed prefix: seq_lens is the
+        # committed length and the rows walk forward from it.
         prefix = base
         limit = base + eff
     else:

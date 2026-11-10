@@ -65,6 +65,9 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
     out_cache_loc: torch.Tensor
     token_to_kv_pool: object
     compress_ratio: int
+    # Per-request pending-ring stride; equals compress_ratio unless a wide
+    # verify window needs more pending slots than one group holds.
+    ring_stride: int
     block_topk: int
     req_pool_indices: Optional[torch.Tensor] = None
     # Parallel per-group arrays for the groups compressed this forward:
@@ -219,6 +222,22 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
         )
 
 
+def qsa_pending_ring_stride(*, compress_ratio: int, max_write_positions: int) -> int:
+    """Per-request pending-ring stride that keeps one forward collision-free.
+
+    A window within one group keeps the ratio-sized ring it has always used.
+    Beyond that the stride must span every position a completing group can
+    reach -- the ``ratio - 1`` before this forward plus the ones it writes --
+    and stay a multiple of the ratio so a group's members keep distinct slots.
+    """
+    compress_ratio = int(compress_ratio)
+    max_write_positions = max(1, int(max_write_positions))
+    if max_write_positions <= compress_ratio:
+        return compress_ratio
+    needed = compress_ratio - 1 + max_write_positions
+    return -(needed // -compress_ratio) * compress_ratio
+
+
 def build_pending_ring_slots(
     *,
     token_to_batch_idx: torch.Tensor,
@@ -226,19 +245,22 @@ def build_pending_ring_slots(
     sequence_lengths: torch.Tensor,
     logical_positions: torch.Tensor,
     compress_ratio: int,
+    ring_stride: int,
     is_extend: bool,
 ) -> torch.Tensor:
-    """Pending-ring slot ``req_pool_idx * ratio + position % ratio`` per token.
-    On extend, tokens before the pending tail dump into rows [0, ratio),
-    which no request owns (request slot 0 is never allocated); CUDA-graph safe."""
+    """Pending-ring slot ``req_pool_idx * stride + position % stride`` per token.
+    On extend, tokens before the pending tail dump into rows [0, stride),
+    which no request owns (request slot 0 is never allocated); CUDA-graph safe.
+    The stride is a multiple of the ratio, wider than it only when a verify
+    window writes more positions than one group holds."""
     rows = token_to_batch_idx.long()[: logical_positions.numel()]
     requests = req_pool_indices.long()[rows]
     positions = logical_positions.long()
-    slots = requests * compress_ratio + positions % compress_ratio
+    slots = requests * ring_stride + positions % ring_stride
     if is_extend:
         lengths = sequence_lengths.long()[rows]
         pending = positions >= (lengths // compress_ratio) * compress_ratio
-        slots = torch.where(pending, slots, positions % compress_ratio)
+        slots = torch.where(pending, slots, positions % ring_stride)
     return slots
 
 
@@ -248,8 +270,13 @@ def build_group_ring_slots(
     group_end_positions: torch.Tensor,
     sequence_ids: torch.Tensor,
     compress_ratio: int,
+    ring_stride: int,
 ) -> torch.Tensor:
-    """Ring slots of a planned group's members, oldest first."""
+    """Ring slots of a planned group's members, oldest first.
+
+    A group spans ``ratio`` consecutive positions and the stride is a multiple
+    of the ratio, so the members still land on distinct slots.
+    """
     requests = req_pool_indices.long()[sequence_ids]
     offsets = torch.arange(
         compress_ratio - 1,
@@ -259,7 +286,7 @@ def build_group_ring_slots(
         dtype=torch.long,
     )
     positions = (group_end_positions[:, None] - offsets[None, :]).clamp_min(0)
-    return requests[:, None] * compress_ratio + positions % compress_ratio
+    return requests[:, None] * ring_stride + positions % ring_stride
 
 
 def build_rope_position_matrix(
@@ -306,6 +333,7 @@ def compressed_decode_view(
 __all__ = [
     "QSAIndexerMetadata",
     "build_qsa_row_ranges",
+    "qsa_pending_ring_stride",
     "build_pending_ring_slots",
     "build_group_ring_slots",
     "build_rope_position_matrix",

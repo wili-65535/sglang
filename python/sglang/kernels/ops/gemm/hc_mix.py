@@ -13,7 +13,14 @@ import torch
 import triton
 import triton.language as tl
 
-_FUSED_MIX_MAX_ROWS = 16
+# Rows are padded to a power of two and the padded count is a constexpr, so the
+# cap is a shared-memory limit rather than a property of the math. Measured on
+# SM120 (101376 B/block): BLOCK_K=256 stops fitting past 32 padded rows, and
+# BLOCK_K=128 still compiles at 128. Capped at 64 because that is the widest
+# verify window benchmarked; beyond it the fallback below takes over.
+_FUSED_MIX_MAX_ROWS = 64
+# Padded rows above this need the narrower K tile to fit shared memory.
+_WIDE_K_MAX_ROWS = 32
 
 
 @triton.jit
@@ -188,13 +195,44 @@ def fused_hc_mix(
 ) -> torch.Tensor:
     rows, k = hyper_input_normed.shape
     lowrank = w_down.shape[0]
-    rows_pad = 16
+    # 16 was the only width this kernel ever ran at; keep it as the floor so
+    # short batches compile the same program they always did.
+    rows_pad = max(16, triton.next_power_of_2(rows))
+    block_k = 256 if rows_pad <= _WIDE_K_MAX_ROWS else 128
     device = hyper_input_normed.device
     num_ctas = torch.cuda.get_device_properties(device).multi_processor_count
     t_raw = torch.empty((rows_pad, lowrank), dtype=torch.float32, device=device)
     out = torch.empty((rows, hs), dtype=hyper_input_normed.dtype, device=device)
     if rows == 0:
         return out
+    try:
+        _launch(
+            hyper_input_normed, w_down, w_up, t_raw, out, device,
+            num_ctas, k, lowrank, hs, rows, hc, rows_pad, block_k,
+        )
+    except triton.runtime.errors.OutOfResources:
+        # Shared memory also scales with hc and the low rank, which no caller
+        # has had to vary yet; rather than crash a server on an unmeasured
+        # shape, fall back to the eager chain this kernel replaces.
+        return _eager_mix(hyper_input_normed, w_down, w_up, hc, hs)
+    return out
+
+
+def _eager_mix(hyper_input_normed, w_down, w_up, hc: int, hs: int):
+    """GatedResidual._mix_compute, duplicated here as the out-of-resource path."""
+    t = torch.nn.functional.silu(
+        torch.nn.functional.linear(hyper_input_normed, w_down) / hc
+    )
+    u = torch.sigmoid(torch.nn.functional.linear(t, w_up))
+    return (
+        u.unflatten(-1, (hc, hs)) * hyper_input_normed.unflatten(-1, (hc, hs))
+    ).mean(dim=-2)
+
+
+def _launch(
+    hyper_input_normed, w_down, w_up, t_raw, out, device,
+    num_ctas, k, lowrank, hs, rows, hc, rows_pad, block_k,
+):
     _hc_mix_persistent_kernel[(num_ctas,)](
         hyper_input_normed,
         w_down,
@@ -211,9 +249,8 @@ def fused_hc_mix(
         ROWS=rows_pad,
         HC=hc,
         BLOCK_N=32,
-        BLOCK_K=256,
+        BLOCK_K=block_k,
         BLOCK_J=32,
         BLOCK_R=64,
         num_warps=8,
     )
-    return out
